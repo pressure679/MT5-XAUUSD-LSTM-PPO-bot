@@ -2,38 +2,50 @@
 bot_v2.py -- LSTM-PPO XAUUSD trading bot, stochastic/%R zone-breakout +
 1h/4h HalfTrend variant.
 
-A second, independent strategy alongside bot.py's ICT/SMC bot -- same
-LSTM-PPO/GBDT-filter skeleton (agent, checkpointing, weekly training
-cadence, win-rate gating), but a much smaller technical stack and a
-different entry model:
+A second, independent strategy alongside bot.py's ICT/SMC bot, built the
+same way bot.py itself is: it *executes* bar-by-bar on 1-minute candles
+(order fills, SL/TP hit detection all happen at 1m granularity) but
+*analyzes* higher timeframes -- every 1m row sees the full indicator +
+entry-signal stack recomputed on 5m, 15m, 1h and 4h candles resampled
+from that same 1m data, merged back on with a 5m_/15m_/1h_/4h_ prefix
+(forward-filled, so a bar only ever sees the most recently *closed*
+higher-tf candle -- no lookahead). This is exactly bot.py's own
+multi-timeframe merge (see its add_indicators()), just run across four
+timeframes instead of two, and with a much smaller indicator stack per
+timeframe:
 
-  Indicators (all computed on M15 candles, resampled from the 1-minute
-  CSV for training / fetched directly from MT5 for live trading):
+  Per analyzed timeframe (5m/15m/1h/4h) -- see _add_base_indicators():
     - EMA 7 / 21, each vs. price (distance) and its own slope
-    - HalfTrend (bullish/bearish) on M15, plus its own distance from price
+    - HalfTrend (bullish/bearish), plus its own distance from price
     - ADX (+DI/-DI) as a trend-strength floor
     - Stochastic oscillator (%K / %K-smooth)
     - Williams %R
+    - The stoch/%R zone-breakout entry signal (see below)
 
-  Entry gate ("stoch_r_zone_breakout" below):
+  Entry gate ("stoch_r_zone_breakout" below), evaluated independently
+  on each of the 4 analyzed timeframes:
     A bar counts as oversold once %K < 20 OR %R < -80, overbought once
-    %K > 80 OR %R > -20. Once either state has held for
-    ZONE_BARS (=5) consecutive bars, that run's high/low forms a
+    %K > 80 OR %R > -20. Once either state has held for ZONE_BARS (=5)
+    consecutive bars *of that timeframe*, that run's high/low forms a
     "zone" -- a breakout above the zone high (confirmed by %K crossing
     back above %K-smooth) is a bullish signal; a breakdown below the
-    zone low (%K crossing back below %K-smooth) is bearish. This is one
+    zone low (%K crossing back below %K-smooth) is bearish. A candidate
+    trade fires whenever ANY of the 4 timeframes signals a breakout
+    (with that timeframe's own ADX clearing ADX_MIN) -- this is one
     reasonable reading of "stoch k </> k smooth, and/or %r, wait 5
-    candles in ob/os zone, then breakout" -- adjust the thresholds in
-    the constants below if a different reading was intended.
+    candles in ob/os zone, then breakout, executed on 5m/15m/1h/4h" --
+    adjust the thresholds/combination logic below if a different
+    reading was intended.
 
-  Direction filter: a breakout signal only becomes a candidate trade if
-  the 1h and/or 4h HalfTrend agrees with its direction -- see
-  --htf-mode ("any" = one of the two agrees, "both" = both must).
+  Direction filter: a breakout candidate only becomes a trade if the 1h
+  and/or 4h HalfTrend agrees with its direction -- see --htf-mode
+  ("any" = one of the two agrees, "both" = both must). The bot never
+  trades against both.
 
   The LSTM-PPO agent then decides whether to actually take a candidate
   signal (or hold) -- same "agent times entries, deterministic stack
-  picks direction" split bot.py's HalfTrend-redirect uses. Actions are
-  0=buy, 1=sell, 2=hold (BUY/SELL/HOLD below), per spec.
+  picks direction" split bot.py's own HalfTrend-redirect uses. Actions
+  are 0=buy, 1=sell, 2=hold (BUY/SELL/HOLD below), per spec.
 
   Risk/reward is fixed at 1:4 -- a 50-pip stop, 200-pip target
   (SL_PIPS / RR_RATIO below). Before a buy/sell is allowed through, a
@@ -51,6 +63,11 @@ different entry model:
   position (risk_multiplier() below) -- so a barely-qualifying setup
   risks the plain --risk amount, a strongly-favoured one risks several
   multiples of it (capped at MAX_RISK_MULTIPLIER).
+
+  Weekly stats (trade count, PnL, R-multiple, win rate, mean win/loss,
+  streaks, Z-score, profit factor, recovery factor, Sharpe, Sortino,
+  GBDT filter state) print every simulated training week, same cadence
+  and same metrics as bot.py's own weekly report.
 
 Checkpoints and the GBDT filter's sample pickle are saved under a
 directory + tag distinct from bot.py's (SAVE_DIR / model_tag()) so the
@@ -100,20 +117,20 @@ BUY, SELL, HOLD = 0, 1, 2
 # ==========================================================================
 # STRATEGY CONSTANTS
 # ==========================================================================
-SEQ_LEN = 20                    # LSTM lookback window, in M15 bars (~5h)
+SEQ_LEN = 15                    # LSTM lookback window, in 1m bars -- matches bot.py's own SEQ_LEN
 SL_PIPS = 50.0                  # fixed stop-loss
 RR_RATIO = 4.0                  # 1:4 risk:reward
 TP_PIPS = SL_PIPS * RR_RATIO    # 200-pip target
 PIP_VALUE = 0.1                 # $ per pip for XAUUSD, matches bot.py's convention
 COMMISSION = 0.6                # pips, subtracted from every closed trade in the backtest
 
-ADX_MIN = 20                    # trend-strength floor a breakout must clear to be tradeable
-ZONE_BARS = 5                   # consecutive OB/OS bars required before a breakout can fire
+ADX_MIN = 20                    # trend-strength floor a timeframe's breakout must clear to count
+ZONE_BARS = 5                   # consecutive OB/OS bars (of whichever tf) required before a breakout can fire
 STOCH_OS, STOCH_OB = 20, 80     # %K oversold / overbought thresholds
 WR_OS, WR_OB = -80, -20         # Williams %R oversold / overbought thresholds
 
 WEEKS_BEFORE_FILTER = 5         # GBDT win-rate filter starts gating after this many training weeks
-TRADING_WEEK_BARS = 4 * 24 * 5  # M15 bars in a 5-day trading week (96/day)
+TRADING_WEEK_BARS = 1440 * 5    # 1m bars in a 5-day trading week -- same definition as bot.py's save_count
 
 BASE_MIN_WINRATE = (1 / (1 + RR_RATIO)) * 1.1  # breakeven (20%) * 1.1 = 22%
 
@@ -333,6 +350,9 @@ def stoch_r_zone_breakout(df, zone_bars=ZONE_BARS):
 # FEATURE PIPELINE
 # ==========================================================================
 
+# The indicator + entry-signal stack computed independently on each
+# analyzed timeframe (see _add_base_indicators()) -- never on the raw
+# 1m data itself, which only supplies OHLC for execution.
 BASE_INDICATOR_FEATURES = [
     "k", "k_smooth", "williams_r", "adx", "+di", "-di",
     "EMA7_dist", "EMA7_slope", "EMA21_dist", "EMA21_slope",
@@ -340,22 +360,31 @@ BASE_INDICATOR_FEATURES = [
     "os_streak", "ob_streak", "bull_breakout", "bear_breakout",
 ]
 
-FEATURES = BASE_INDICATOR_FEATURES + [
-    "1h_bullish_halftrend", "1h_bearish_halftrend",
-    "4h_bullish_halftrend", "4h_bearish_halftrend",
+# (column prefix, pandas resample frequency) -- the four timeframes
+# analyzed off of the raw 1m execution data. 1h/4h double as the
+# direction filter (see _htf_ok_columns()); all four feed the
+# stoch/%R zone-breakout entry signal (see bull_signal/bear_signal in
+# train_bot()/test_bot()).
+ANALYZED_TIMEFRAMES = (
+    ("5m", "5min"),
+    ("15m", "15min"),
+    ("1h", "1h"),
+    ("4h", "4h"),
+)
+
+FEATURES = [
+    f"{prefix}_{col}"
+    for prefix, _ in ANALYZED_TIMEFRAMES
+    for col in BASE_INDICATOR_FEATURES
 ]
 
 
-def add_indicators(df, include_higher_tf=True):
-    """df must already be M15 OHLC candles (Open/High/Low/Close). Adds
-    the full BASE_INDICATOR_FEATURES stack, then -- if include_higher_tf
-    -- resamples the same M15 candles up to 1h and 4h, runs HalfTrend on
-    each, and merges those two flags back onto every M15 row (ffill, so
-    a bar only ever sees the most recently *closed* higher-tf candle,
-    same no-lookahead pattern as bot.py's multi-timeframe merge)."""
-
-    if include_higher_tf:
-        raw = df.copy()
+def _add_base_indicators(df):
+    """Adds the shared indicator + zone-breakout stack
+    (BASE_INDICATOR_FEATURES) to an OHLC dataframe at whatever
+    timeframe it's given. Called once per analyzed timeframe by
+    add_indicators() below -- never on the raw 1m data directly."""
+    df = df.copy()
 
     df["adx"], df["+di"], df["-di"] = ADX(df)
     df["k"], df["k_smooth"] = STOCH(df)
@@ -376,54 +405,46 @@ def add_indicators(df, include_higher_tf=True):
         stoch_r_zone_breakout(df)
     )
 
-    df = df[[
-        "Open", "High", "Low", "Close",
-        "k", "k_smooth", "williams_r", "adx", "+di", "-di",
-        "EMA7", "EMA7_slope", "EMA7_dist",
-        "EMA21", "EMA21_slope", "EMA21_dist",
-        "bullish_halftrend", "bearish_halftrend", "halftrend_dist",
-        "bull_breakout", "bear_breakout", "os_streak", "ob_streak",
-    ]].copy()
-
-    if include_higher_tf:
-        for prefix, freq in (("1h", "1h"), ("4h", "4h")):
-
-            df_tf = raw.resample(
-                freq, label="right", closed="left"
-            ).agg({
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-            }).dropna()
-
-            bull_ht, bear_ht, _ = HalfTrend(df_tf)
-
-            df_tf = pd.DataFrame({
-                f"{prefix}_bullish_halftrend": bull_ht,
-                f"{prefix}_bearish_halftrend": bear_ht,
-            }, index=df_tf.index)
-
-            df = pd.concat(
-                [df, df_tf.reindex(df.index, method="ffill")],
-                axis=1
-            )
-
-    df.dropna(inplace=True)
-    return df
+    return df[BASE_INDICATOR_FEATURES]
 
 
-def resample_to_m15(df):
-    """1-minute OHLC -> M15 OHLC, right-labeled/left-closed so a bin is
-    only visible once it has actually closed."""
-    return df.resample(
-        "15min", label="right", closed="left"
-    ).agg({
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-    }).dropna()
+def add_indicators(df):
+    """df must be raw 1-minute OHLC candles (Open/High/Low/Close). The
+    bot executes at this same 1m granularity (bar-by-bar SL/TP
+    tracking, order fills) -- same execution model as bot.py -- but no
+    indicators are computed on the 1m data itself. Instead, each of
+    ANALYZED_TIMEFRAMES (5m/15m/1h/4h) is resampled from it
+    (right-labeled/left-closed, so a bin is only visible once it has
+    actually closed), the full indicator + zone-breakout stack
+    (_add_base_indicators) runs on that resampled frame, and the
+    result is merged back onto every 1m row -- prefixed
+    5m_/15m_/1h_/4h_, forward-filled so a bar only ever sees the most
+    recently *closed* higher-tf candle. Same no-lookahead
+    multi-timeframe merge bot.py's own add_indicators() uses, just run
+    across four timeframes instead of two."""
+
+    result = df[["Open", "High", "Low", "Close"]].copy()
+
+    for prefix, freq in ANALYZED_TIMEFRAMES:
+
+        df_tf = df.resample(
+            freq, label="right", closed="left"
+        ).agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+        }).dropna()
+
+        df_tf = _add_base_indicators(df_tf).add_prefix(f"{prefix}_")
+
+        result = pd.concat(
+            [result, df_tf.reindex(result.index, method="ffill")],
+            axis=1
+        )
+
+    result.dropna(inplace=True)
+    return result
 
 
 def load_last_mb_xauusd(file_path=None, mb=20, delimiter=",", col_names=None):
@@ -1080,6 +1101,23 @@ def _htf_ok_columns(df, htf_mode):
     return long_ok, short_ok
 
 
+def _signal_columns(df):
+    """bull_signal/bear_signal: True on any bar where ANY analyzed
+    timeframe (5m/15m/1h/4h) has a live zone-breakout AND that same
+    timeframe's own ADX clears ADX_MIN -- i.e. the stoch/%R zone-
+    breakout strategy is "executed on" all four timeframes at once,
+    any one of them firing is enough to produce a candidate."""
+    bull_signal = pd.Series(False, index=df.index)
+    bear_signal = pd.Series(False, index=df.index)
+
+    for prefix, _ in ANALYZED_TIMEFRAMES:
+        tf_adx_ok = df[f"{prefix}_adx"] >= ADX_MIN
+        bull_signal |= df[f"{prefix}_bull_breakout"].astype(bool) & tf_adx_ok
+        bear_signal |= df[f"{prefix}_bear_breakout"].astype(bool) & tf_adx_ok
+
+    return bull_signal, bear_signal
+
+
 def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
 
     print("Training bot (stoch/%R zone-breakout + 1h/4h HalfTrend)")
@@ -1087,14 +1125,18 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
 
     TRAIN_HISTORY_MB = 20
     df_m1 = load_last_mb_xauusd(mb=TRAIN_HISTORY_MB)
-    print(f"Resampling to M15 and computing indicators... ({time.strftime('%H:%M')})")
-    df = add_indicators(resample_to_m15(df_m1))
+    print(f"Computing 5m/15m/1h/4h indicators over 1m execution data... ({time.strftime('%H:%M')})")
+    df = add_indicators(df_m1)
     elapsed = int((time.perf_counter() - start) // 60)
-    print(f"Loaded indicators on {len(df)} M15 bars (Elapsed: {elapsed}m)")
+    print(f"Loaded indicators on {len(df)} 1m bars (Elapsed: {elapsed}m)")
 
     long_htf_ok, short_htf_ok = _htf_ok_columns(df, htf_mode)
     df["long_htf_ok"] = long_htf_ok
     df["short_htf_ok"] = short_htf_ok
+
+    bull_signal, bear_signal = _signal_columns(df)
+    df["bull_signal"] = bull_signal
+    df["bear_signal"] = bear_signal
 
     tag = model_tag(symbol)
 
@@ -1111,17 +1153,15 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
     MIN_WINRATE = gbdt.min_winrate(BASE_MIN_WINRATE)
 
     # Precompute everything the loop needs as plain arrays once, up
-    # front -- this dataset is M15 bars (a fraction of bot.py's 1m
-    # dataset) and only 20 features, so there's no need for bot.py's
-    # weekly-slice caching trick; one np.float32 matrix for the whole
-    # run is small and simple.
+    # front, same spirit as bot.py's weekly-slice caching but simpler
+    # since the full feature matrix here (1m bars x 68 features) is
+    # small enough to hold in memory for the whole run at once.
     feature_matrix = df[FEATURES].to_numpy(dtype=np.float32)
     close_arr = df["Close"].to_numpy()
     high_arr = df["High"].to_numpy()
     low_arr = df["Low"].to_numpy()
-    adx_arr = df["adx"].to_numpy()
-    bull_breakout_arr = df["bull_breakout"].to_numpy()
-    bear_breakout_arr = df["bear_breakout"].to_numpy()
+    bull_signal_arr = df["bull_signal"].to_numpy()
+    bear_signal_arr = df["bear_signal"].to_numpy()
     long_htf_ok_arr = df["long_htf_ok"].to_numpy()
     short_htf_ok_arr = df["short_htf_ok"].to_numpy()
 
@@ -1171,11 +1211,10 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
                 # HalfTrend-redirect: technicals pick direction, the
                 # agent times entries).
                 candidate = HOLD
-                if adx_arr[i] >= ADX_MIN:
-                    if bull_breakout_arr[i] and long_htf_ok_arr[i]:
-                        candidate = BUY
-                    elif bear_breakout_arr[i] and short_htf_ok_arr[i]:
-                        candidate = SELL
+                if bull_signal_arr[i] and long_htf_ok_arr[i]:
+                    candidate = BUY
+                elif bear_signal_arr[i] and short_htf_ok_arr[i]:
+                    candidate = SELL
 
                 if action in (BUY, SELL):
                     action = candidate if candidate != HOLD else HOLD
@@ -1369,12 +1408,10 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
 # LIVE TRADING
 # ==========================================================================
 
-def _fetch_m15(symbol, n):
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, n)
-    d = pd.DataFrame(rates)
-    d.rename(columns={
+def _rename_mt5_rates(d):
+    d = d.rename(columns={
         "open": "Open", "high": "High", "low": "Low", "close": "Close", "time": "Date"
-    }, inplace=True)
+    })
     d["Date"] = pd.to_datetime(d["Date"], unit="s", utc=True)
     d.set_index("Date", inplace=True)
     return d[["Open", "High", "Low", "Close"]]
@@ -1399,44 +1436,68 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
     gbdt.load()
     MIN_WINRATE = gbdt.min_winrate(BASE_MIN_WINRATE)
 
-    # M15 bars -- generous margin over the largest lookback (the 4h
-    # HalfTrend resample needs ~21 four-hour candles = ~336 M15 bars)
-    # plus SEQ_LEN, so add_indicators()'s dropna() never wipes out the
-    # tail we actually need.
-    LIVE_HISTORY_BARS = SEQ_LEN * 40
+    # ==========================================================
+    # INITIAL LOAD
+    # ==========================================================
+    # 1-minute bars -- generous margin over the largest lookback (the
+    # 4h branch's EMA21/ADX/STOCH need ~21 four-hour candles = ~5040
+    # 1m bars) plus HalfTrend/zone-breakout warmup on every analyzed
+    # timeframe, so add_indicators()'s dropna() never wipes out the
+    # tail we actually need. Same role bot.py's LIVE_HISTORY_BARS
+    # plays for its own (smaller, 15m-max) multi-timeframe merge.
+    LIVE_HISTORY_BARS = 12000
 
-    raw_m15 = _fetch_m15(symbol, LIVE_HISTORY_BARS)
-    df = add_indicators(raw_m15.copy())
+    rates_m1 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, LIVE_HISTORY_BARS)
+    raw_df = _rename_mt5_rates(pd.DataFrame(rates_m1))
 
-    last_bar_epoch = int(mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 1)[0]["time"])
+    df = add_indicators(raw_df.copy())
 
+    last_m1_epoch = int(raw_df.index[-1].timestamp())
     last_trading_date = df.index[-1].date()
     day_start_balance = mt5.account_info().balance
+
+    # ==========================================================
+    # MAIN LOOP
+    # ==========================================================
 
     while True:
 
         now = datetime.now()
-        seconds_into_bar = (now.minute % 15) * 60 + now.second
-        sleep_for = max((15 * 60) - seconds_into_bar + 1, 1)
-        time.sleep(sleep_for)
+        seconds_until_next_minute = 60 - now.second - now.microsecond / 1_000_000
+        if seconds_until_next_minute <= 0:
+            seconds_until_next_minute += 0.25
+        time.sleep(seconds_until_next_minute)
 
-        new_bar = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 1)
-        current_bar_epoch = int(new_bar[0]["time"])
+        # ======================================================
+        # CHECK FOR NEW M1 CANDLE
+        # ======================================================
+        new_m1 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 1)
+        current_m1_epoch = int(new_m1[0]["time"])
 
-        while current_bar_epoch == last_bar_epoch:
-            new_bar = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 1)
-            current_bar_epoch = int(new_bar[0]["time"])
+        while current_m1_epoch == last_m1_epoch:
+            new_m1 = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 1)
+            current_m1_epoch = int(new_m1[0]["time"])
 
-        last_bar_epoch = current_bar_epoch
+        last_m1_epoch = current_m1_epoch
 
-        raw_m15 = _fetch_m15(symbol, LIVE_HISTORY_BARS)
-        df = add_indicators(raw_m15.copy())
+        # ======================================================
+        # APPEND NEW CANDLE, RECOMPUTE INDICATORS
+        # ======================================================
+        new_row = _rename_mt5_rates(pd.DataFrame(new_m1))
+
+        if new_row.index[-1] != raw_df.index[-1]:
+            raw_df = pd.concat([raw_df, new_row])
+            raw_df = raw_df.tail(LIVE_HISTORY_BARS)
+            df = add_indicators(raw_df.copy())
 
         state_seq = df[FEATURES].tail(SEQ_LEN).to_numpy(dtype=np.float32)
         if state_seq.shape[0] != SEQ_LEN:
             print(f"Bad state shape: {state_seq.shape}")
             continue
 
+        # ======================================================
+        # PPO DECISION
+        # ======================================================
         open_pos = open_positions(symbol)
 
         result = agent.select_action(state_seq, open_pos > 0, training=False)
@@ -1454,12 +1515,24 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
             long_ok = bool(current["1h_bullish_halftrend"]) and bool(current["4h_bullish_halftrend"])
             short_ok = bool(current["1h_bearish_halftrend"]) and bool(current["4h_bearish_halftrend"])
 
+        # Candidate direction: ANY analyzed timeframe (5m/15m/1h/4h)
+        # signalling a zone-breakout with its own ADX clearing
+        # ADX_MIN is enough -- same _signal_columns() logic as
+        # train_bot(), evaluated on just the latest bar here.
+        bull_signal = any(
+            bool(current[f"{prefix}_bull_breakout"]) and current[f"{prefix}_adx"] >= ADX_MIN
+            for prefix, _ in ANALYZED_TIMEFRAMES
+        )
+        bear_signal = any(
+            bool(current[f"{prefix}_bear_breakout"]) and current[f"{prefix}_adx"] >= ADX_MIN
+            for prefix, _ in ANALYZED_TIMEFRAMES
+        )
+
         candidate = HOLD
-        if current["adx"] >= ADX_MIN:
-            if bool(current["bull_breakout"]) and long_ok:
-                candidate = BUY
-            elif bool(current["bear_breakout"]) and short_ok:
-                candidate = SELL
+        if bull_signal and long_ok:
+            candidate = BUY
+        elif bear_signal and short_ok:
+            candidate = SELL
 
         if action in (BUY, SELL):
             action = candidate if candidate != HOLD else HOLD
@@ -1479,11 +1552,14 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
 
         # Flatten and force HOLD heading into the daily close, same
         # convention as bot.py.
-        if current_time.hour == 23 and current_time.minute >= 45:
+        if current_time.hour == 23 and current_time.minute >= 55:
             if open_pos != 0:
                 close_trades()
             action = HOLD
 
+        # ======================================================
+        # OPEN NEW TRADE
+        # ======================================================
         if open_pos == 0 and action in (BUY, SELL):
 
             account = mt5.account_info()

@@ -195,10 +195,17 @@ Key constants (edit in-file — there's no config file):
 
 ## bot_v2.py — stoch/%R zone-breakout + HalfTrend variant
 
-A second, independent LSTM-PPO strategy in its own file. Same agent/checkpoint/
-GBDT-win-rate-filter skeleton as `bot.py`, but a much smaller technical stack, a
-different entry model, and its own save directory (`LSTM-PPO-saves-stoch-halftrend/`)
-so the two bots never collide or load each other's (differently-shaped) checkpoints.
+A second, independent LSTM-PPO strategy in its own file, built the same way `bot.py`
+itself is: it *executes* bar-by-bar on **1-minute candles** (order fills, SL/TP hit
+detection all happen at 1m granularity) but *analyzes* higher timeframes — every 1m
+row sees the full indicator + entry-signal stack recomputed on **5m, 15m, 1h and 4h**
+candles resampled from that same 1m data, merged back on with a `5m_`/`15m_`/`1h_`/`4h_`
+prefix (forward-filled, so a bar only ever sees the most recently *closed* higher-tf
+candle — no lookahead). This is exactly `bot.py`'s own multi-timeframe merge, just run
+across four timeframes instead of two, and with a much smaller indicator stack per
+timeframe. Same agent/checkpoint/GBDT-win-rate-filter skeleton as `bot.py`, and its own
+save directory (`LSTM-PPO-saves-stoch-halftrend/`) so the two bots never collide or
+load each other's (differently-shaped) checkpoints.
 
 ```bash
 python bot_v2.py --train                                # train against historical data
@@ -206,34 +213,48 @@ python bot_v2.py --test --symbol XAUUSD-STDc --risk 0.01 # trade live via MT5
 python bot_v2.py --train --test --risk 0.02 --htf-mode both
 ```
 
-### Indicators
+### Indicators — per analyzed timeframe (`_add_base_indicators()`)
 
-All computed on **M15 candles** (resampled from the 1-minute CSV for training,
-fetched directly from MT5 for live trading):
+Computed independently on each of 5m, 15m, 1h and 4h (never on the raw 1m execution
+data itself):
 
 - EMA 7 / 21, each vs. price (distance) and its own slope
 - HalfTrend (bullish/bearish), plus its distance from price
 - ADX (+DI/-DI) — used as a trend-strength floor (`ADX_MIN = 20`)
 - Stochastic oscillator (%K / %K-smooth)
 - Williams %R
+- The stoch/%R zone-breakout entry signal itself (below)
 
-### Entry gate — `stoch_r_zone_breakout()`
+### Entry gate — `stoch_r_zone_breakout()`, run on every analyzed timeframe
 
-A bar counts as **oversold** once %K < 20 OR %R < -80, **overbought** once %K > 80 OR
-%R > -20. Once either state has held for `ZONE_BARS` (5) consecutive bars, that run's
-high/low forms a "zone" — a close breaking above the zone high (confirmed by %K
-crossing back above %K-smooth) is a bullish breakout signal; a close breaking below the
-zone low (%K crossing back below %K-smooth) is bearish.
+A bar (of whichever timeframe) counts as **oversold** once %K < 20 OR %R < -80,
+**overbought** once %K > 80 OR %R > -20. Once either state has held for `ZONE_BARS` (5)
+consecutive bars *of that timeframe*, that run's high/low forms a "zone" — a close
+breaking above the zone high (confirmed by %K crossing back above %K-smooth) is a
+bullish breakout signal; a close breaking below the zone low (%K crossing back below
+%K-smooth) is bearish. A candidate trade fires whenever **any** of the 4 analyzed
+timeframes signals a breakout with that same timeframe's own ADX clearing `ADX_MIN` —
+see `_signal_columns()` (training) / the inline `bull_signal`/`bear_signal` check
+(live).
 
-**Direction filter:** a breakout signal only becomes a candidate trade if the 1h and/or
-4h HalfTrend agrees with its direction — `--htf-mode any` (default) needs one of the
-two, `--htf-mode both` needs both.
+**Direction filter:** a breakout candidate only becomes a trade if the 1h and/or 4h
+HalfTrend agrees with its direction — `--htf-mode any` (default) needs one of the two,
+`--htf-mode both` needs both. The bot never trades against both.
 
 The LSTM-PPO agent then decides whether to actually take a candidate signal (or hold) —
 the deterministic technical stack always picks the direction, the same "agent times
 entries" split `bot.py`'s HalfTrend-redirect uses; the agent's 3 actions are **0=buy,
 1=sell, 2=hold** (`BUY`/`SELL`/`HOLD` in the file — note this ordering is not the same
 as `bot.py`'s own agent).
+
+### Weekly stats
+
+Same cadence and metrics as `bot.py`'s own weekly report — trade count, PnL (pips and
+R-multiple), max drawdown, win rate, mean win/loss, average win/loss streak, Z-score,
+profit factor, recovery factor, Sharpe, Sortino — plus the current `MIN_WINRATE` and
+whether the GBDT filter is active yet or still bootstrapping. Printed every
+`TRADING_WEEK_BARS` (1440 × 5 = one 5-day week of 1-minute bars, same definition as
+`bot.py`'s `save_count`) during `train_bot()`.
 
 ### Risk / reward and position sizing
 
@@ -261,14 +282,20 @@ exist yet. Persisted to
 ### Notes / interpretation choices
 
 - The spec this strategy was built from ("stoch k </> k smooth, and/or %r, wait 5
-  candles in ob/os zone, then breakout, only in direction with 1h and/or 4h halftrend")
-  admits more than one reading — the thresholds and confirmation logic above are one
+  candles in ob/os zone, then breakout, executed on 5m/15m/1h/4h, only in direction
+  with 1h and/or 4h halftrend") admits more than one reading — the thresholds,
+  per-timeframe "any one fires" combination, and confirmation logic above are one
   reasonable interpretation; adjust the constants near the top of `bot_v2.py`
-  (`STOCH_OS`/`STOCH_OB`, `WR_OS`/`WR_OB`, `ZONE_BARS`, `ADX_MIN`) if a different one
-  was intended.
+  (`STOCH_OS`/`STOCH_OB`, `WR_OS`/`WR_OB`, `ZONE_BARS`, `ADX_MIN`, `ANALYZED_TIMEFRAMES`)
+  or `_signal_columns()`'s combination logic if a different one was intended.
 - "Add 1R to risk per +10% predicted win rate" is implemented as a risk *multiplier*
   (1 + one extra unit of `--risk` per 10-point margin above the win-rate bar, capped at
   5x) rather than a running additive R-ladder — see `risk_multiplier()`.
+- `state_size` (`len(FEATURES)`, 68 = 17 indicators × 4 timeframes) must match whatever
+  a saved checkpoint was trained with, same caveat as `bot.py`'s own — a feature-set
+  change (e.g. adding/removing an analyzed timeframe) needs a fresh `train_bot()` run
+  before `test_bot()` can load the new checkpoint, and makes any accumulated
+  `.gbdt_winrate.pkl` samples stale.
 - `test_bot()` requires the `MetaTrader5` package and a running MT5 terminal
   (Windows-only); `train_bot()` and the indicator pipeline have no such dependency and
   run anywhere.
