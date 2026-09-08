@@ -249,10 +249,13 @@ as `bot.py`'s own agent).
 
 ### Weekly stats
 
-Same cadence and metrics as `bot.py`'s own weekly report — trade count, PnL (pips and
-R-multiple), max drawdown, win rate, mean win/loss, average win/loss streak, Z-score,
-profit factor, recovery factor, Sharpe, Sortino — plus the current `MIN_WINRATE` and
-whether the GBDT filter is active yet or still bootstrapping. Printed every
+Same metrics as `bot.py`'s own weekly report — trade count, PnL (pips and R-multiple),
+max drawdown, win rate, mean win/loss, average win/loss streak, Z-score, profit factor,
+recovery factor, Sharpe, Sortino — plus the current `MIN_WINRATE` and whether the GBDT
+filter is active yet or still bootstrapping. Unlike `bot.py`, which skips the report on
+a week with 5 or fewer trades, `bot_v2.py` prints every week regardless of trade count
+— including a quiet week with none at all — so there's never a silent gap between
+reports. Printed every
 `TRADING_WEEK_BARS` (1440 × 5 = one 5-day week of 1-minute bars, same definition as
 `bot.py`'s `save_count`) during `train_bot()`.
 

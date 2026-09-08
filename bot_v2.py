@@ -1292,63 +1292,69 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
                 # ==========================================================
                 if save_counter % TRADING_WEEK_BARS == 0:
 
-                    if len(trade_returns) > 5:
+                    # Printed every week regardless of how many trades
+                    # it had -- including zero -- so a quiet week is
+                    # still visible rather than silently skipped. Every
+                    # stat below is guarded against an empty
+                    # trade_returns (np.mean/np.std/winrate would
+                    # otherwise warn or divide by zero); streak_stats()
+                    # and max_drawdown() already handle empty input on
+                    # their own.
+                    wins = [r for r in trade_returns if r > 0]
+                    losses = [r for r in trade_returns if r < 0]
 
-                        wins = [r for r in trade_returns if r > 0]
-                        losses = [r for r in trade_returns if r < 0]
+                    weekly_pnl = np.sum(trade_returns)
+                    winrate = len(wins) / len(trade_returns) if trade_returns else 0.0
+                    mean_win = np.mean(wins) if wins else 0.0
+                    mean_loss = np.mean(losses) if losses else 0.0
 
-                        weekly_pnl = np.sum(trade_returns)
-                        winrate = len(wins) / len(trade_returns)
-                        mean_win = np.mean(wins) if wins else 0
-                        mean_loss = np.mean(losses) if losses else 0
+                    sharpe = sharpe_ratio(trade_returns) if trade_returns else 0.0
+                    sortino = sortino_ratio(trade_returns) if trade_returns else 0.0
 
-                        sharpe = sharpe_ratio(trade_returns)
-                        sortino = sortino_ratio(trade_returns)
+                    std_ret = np.std(trade_returns) if trade_returns else 0.0
+                    zscore = np.mean(trade_returns) / std_ret if std_ret > 0 else 0.0
 
-                        std_ret = np.std(trade_returns)
-                        zscore = np.mean(trade_returns) / std_ret if std_ret > 0 else 0.0
+                    avg_win_streak, avg_loss_streak = streak_stats(trade_returns)
 
-                        avg_win_streak, avg_loss_streak = streak_stats(trade_returns)
+                    gross_profit = sum(wins)
+                    gross_loss = abs(sum(losses))
+                    profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
-                        gross_profit = sum(wins)
-                        gross_loss = abs(sum(losses))
-                        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+                    max_dd = max_drawdown(trade_returns)
+                    R_pnl = weekly_pnl / SL_PIPS
+                    rf = R_pnl / (max_dd / SL_PIPS) if max_dd > 0 else 0.0
 
-                        max_dd = max_drawdown(trade_returns)
-                        R_pnl = weekly_pnl / SL_PIPS
-                        rf = R_pnl / (max_dd / SL_PIPS) if max_dd > 0 else 0.0
+                    print()
+                    print("================================================")
+                    print(f"[{symbol}] WEEKLY PPO TRAINING")
+                    print("================================================")
+                    print(f"Trades:          {len(trade_returns)}")
+                    print(f"Weekly PnL:      {weekly_pnl:.0f} pips")
+                    print(f"Weekly R PnL:    {R_pnl:.2f}R")
+                    print(f"Max DD:          {max_dd/SL_PIPS:.2f}R")
+                    print(f"Winrate:         {winrate*100:.2f}%")
+                    print(f"Mean Win:        {mean_win:.0f} pips")
+                    print(f"Mean Loss:       {mean_loss:.0f} pips")
+                    print(f"Avg Win Streak:  {avg_win_streak:.2f}")
+                    print(f"Avg Loss Streak: {avg_loss_streak:.2f}")
+                    print(f"Z-score:         {zscore:.2f}")
+                    print(f"PF:              {profit_factor:.2f}")
+                    print(f"RF:              {rf:.2f}")
+                    print(f"Sharpe:          {sharpe:.2f}")
+                    print(f"Sortino:         {sortino:.2f}")
+                    print(f"MIN_WINRATE:     {MIN_WINRATE*100:.1f}%")
+                    filter_state = (
+                        "ACTIVE" if gbdt.ready()
+                        else f"bootstrapping ({gbdt.weeks_trained}/{WEEKS_BEFORE_FILTER} weeks)"
+                    )
+                    print(f"GBDT filter:     {filter_state}")
+                    print("================================================")
+                    print()
 
-                        print()
-                        print("================================================")
-                        print(f"[{symbol}] WEEKLY PPO TRAINING")
-                        print("================================================")
-                        print(f"Trades:          {len(trade_returns)}")
-                        print(f"Weekly PnL:      {weekly_pnl:.0f} pips")
-                        print(f"Weekly R PnL:    {R_pnl:.2f}R")
-                        print(f"Max DD:          {max_dd/SL_PIPS:.2f}R")
-                        print(f"Winrate:         {winrate*100:.2f}%")
-                        print(f"Mean Win:        {mean_win:.0f} pips")
-                        print(f"Mean Loss:       {mean_loss:.0f} pips")
-                        print(f"Avg Win Streak:  {avg_win_streak:.2f}")
-                        print(f"Avg Loss Streak: {avg_loss_streak:.2f}")
-                        print(f"Z-score:         {zscore:.2f}")
-                        print(f"PF:              {profit_factor:.2f}")
-                        print(f"RF:              {rf:.2f}")
-                        print(f"Sharpe:          {sharpe:.2f}")
-                        print(f"Sortino:         {sortino:.2f}")
-                        print(f"MIN_WINRATE:     {MIN_WINRATE*100:.1f}%")
-                        filter_state = (
-                            "ACTIVE" if gbdt.ready()
-                            else f"bootstrapping ({gbdt.weeks_trained}/{WEEKS_BEFORE_FILTER} weeks)"
-                        )
-                        print(f"GBDT filter:     {filter_state}")
-                        print("================================================")
-                        print()
-
-                        print(
-                            f"[{symbol}] [INFO] Trained on data "
-                            f"(Elapsed: {timedelta(seconds=int(time.time() - training_start_3))})"
-                        )
+                    print(
+                        f"[{symbol}] [INFO] Trained on data "
+                        f"(Elapsed: {timedelta(seconds=int(time.time() - training_start_3))})"
+                    )
 
                     trade_returns = []
 
