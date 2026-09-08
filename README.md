@@ -285,17 +285,19 @@ rare given how differently each triggers, and resolved by a fixed priority order
 than reconciled — see `_select_candidate()`: stoch/%R breakout first, then the
 PDH/PDL/Asia-level reversal, then OB mitigation.
 
-The GBDT win-rate filter and its risk multiplier (below) are shared across all three —
-one filter, fed the full feature vector regardless of which strategy fired, so it
-learns per-setup-type patterns implicitly rather than needing a separate filter per
-strategy.
+The GBDT win-rate filter model itself is shared across all three — one filter instance,
+fed the full feature vector regardless of which strategy fired, so it learns
+per-setup-type patterns implicitly rather than needing a separate model per strategy —
+but each strategy is gated against its own min-winrate bar (see "Risk sizing" below)
+and, once through, its own risk multiplier off that same bar.
 
 ### Weekly stats
 
 Same metrics as `bot.py`'s own weekly report — trade count, PnL (pips and R-multiple),
 max drawdown, win rate, mean win/loss, average win/loss streak, Z-score, profit factor,
-recovery factor, Sharpe, Sortino — plus the current `MIN_WINRATE`, whether the GBDT
-filter is active yet or still bootstrapping, and a trades-by-strategy breakdown
+recovery factor, Sharpe, Sortino — plus the three currently-active min-winrate bars
+(one per strategy), whether the GBDT filter is active yet or still bootstrapping, and a
+trades-by-strategy breakdown
 (`stoch=`/`poi=`/`ob=` counts) that `bot.py`'s single-strategy report has no need for.
 Unlike `bot.py`, which skips the report on a week with 5 or fewer trades, `bot_v2.py`
 prints every week regardless of trade count — including a quiet week with none at all —
@@ -307,17 +309,22 @@ during `train_bot()`.
 
 A buy/sell from any of the three strategies only clears the GBDT win-rate filter once
 it predicts a win rate at or above a min-winrate bar. By default (no `--min-winrate`
-passed) that bar is computed **per strategy tier**, from its own RR-implied breakeven —
-`_default_min_winrate()`: `max(breakeven * 1.1, 35%)`, so a tier's requirement never
-drops below 35% but can still demand more once its own breakeven*1.1 clears that floor:
+passed) each **strategy has its own bar**:
 
-| Strategy tier | RR | Breakeven | Default bar |
-|---|---|---|---|
-| stoch/%R breakout | 1:4 | 20% | **35.0%** (breakeven×1.1 = 22% doesn't clear the floor) |
-| PDH/PDL/Asia + OB mitigation | 1:2 | 33.3% | **36.7%** (breakeven×1.1 = 36.7% does) |
+| Strategy | RR | Breakeven | Default bar | Source |
+|---|---|---|---|---|
+| stoch/%R breakout | 1:4 | 20% | **35.0%** | `_default_min_winrate()`: breakeven×1.1 = 22% doesn't clear the 35% floor |
+| PDH/PDL/Asia reversal (`poi_reversal`) | 1:2 | 33.3% | **45.0%** | explicit override, not formula-derived |
+| OB mitigation (`ob_mitigation`) | 1:2 | 33.3% | **36.7%** | `_default_min_winrate()`: breakeven×1.1 = 36.7% clears the floor on its own |
+
+The stoch/breakout and OB-mitigation bars come from `_default_min_winrate()`:
+`max(breakeven * 1.1, 35%)`, so neither ever drops below 35% but can still demand more
+once its own breakeven×1.1 clears that floor. `poi_reversal`'s bar is set directly
+(`POI_MIN_WINRATE_DEFAULT`) rather than from that formula, since both level strategies
+share the same 1:2 RR and would otherwise land on the identical 36.7%.
 
 Pass `--min-winrate` (for both `--train` and `--test`, e.g. `--min-winrate 0.4`) to use
-one flat number for both tiers instead of these computed defaults.
+one flat number for all three instead of these defaults.
 
 Position risk scales with the filter's confidence: once active, every full 10
 percentage points its predicted win rate clears above that minimum adds one more unit

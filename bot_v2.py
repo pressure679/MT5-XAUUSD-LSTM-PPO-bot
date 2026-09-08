@@ -78,17 +78,23 @@ GBDT (XGBoost) win-rate filter -- GBDTWinRateFilter, one shared filter
 (one instance, one feature vector covering every strategy's signals)
 across all three strategies -- has to predict a win rate clearing a
 min-winrate bar before a buy/sell from any strategy is allowed
-through. That bar defaults to breakeven (1/(1+rr)) * 1.1, floored at
-35% (MIN_WINRATE_MULTIPLIER / MIN_WINRATE_FLOOR), computed per
-strategy tier's own RR -- STOCH_MIN_WINRATE_DEFAULT (35.0%, since the
-stoch breakout's 1:4 breakeven*1.1 of 22% doesn't clear the floor) and
-LEVEL_MIN_WINRATE_DEFAULT (36.7%, since the level strategies' 1:2
-breakeven*1.1 does) -- or, if --min-winrate is passed, one flat number
-applied the same way to both tiers instead, for both --train and
---test. The filter only starts *gating* trades once 5 simulated
-training weeks have accumulated (WEEKS_BEFORE_FILTER) -- before that it
-keeps fitting/accumulating samples in the background but never blocks a
-trade, so the first weeks of training aren't starved waiting on data
+through. Each strategy has its own bar:
+  - STOCH_MIN_WINRATE_DEFAULT (35.0%): breakeven (1/(1+rr)) * 1.1 for
+    the stoch breakout's 1:4 RR, floored at 35% since its raw
+    breakeven*1.1 (22%) doesn't clear it (MIN_WINRATE_MULTIPLIER /
+    MIN_WINRATE_FLOOR).
+  - OB_MIN_WINRATE_DEFAULT (36.7%): the same formula for the level
+    strategies' 1:2 RR, whose breakeven*1.1 clears the floor on its
+    own.
+  - POI_MIN_WINRATE_DEFAULT (45%): poi_reversal's own bar, raised
+    above the formula-derived value by explicit request rather than
+    computed from breakeven.
+--min-winrate overrides all three defaults with one flat number
+applied alike, for both --train and --test. The filter only starts
+*gating* trades once 5 simulated training weeks have accumulated
+(WEEKS_BEFORE_FILTER) -- before that it keeps fitting/accumulating
+samples in the background but never blocks a trade, so the first
+weeks of training aren't starved waiting on data
 that doesn't exist yet.
 
 Position risk scales with the filter's confidence: once it's active,
@@ -181,14 +187,14 @@ POI_REACH_PIPS = 30             # "within 30 pips of poi" -- shared by both leve
 OB_MULTIPLIER = 1.5             # bot.py's BullishOB/BearishOB impulse-candle size multiplier
 OB_LOOKBACK = 72                # bot.py's OBMitigation() lookback, in bars
 
-# Default min-winrate bar, per strategy tier: breakeven (1/(1+rr)) *
+# Default min-winrate bar, per strategy: breakeven (1/(1+rr)) *
 # MIN_WINRATE_MULTIPLIER, floored at MIN_WINRATE_FLOOR so a
-# high-breakeven low-RR strategy (level strategies' 1:2 breakeven is
-# already 33.3%) is never satisfied by less than the floor, while a
+# high-breakeven low-RR strategy (the level strategies' 1:2 breakeven
+# is already 33.3%) is never satisfied by less than the floor, while a
 # low-breakeven high-RR strategy (the 1:4 stoch breakout's is 20%)
 # still has to clear the floor rather than its own thin 22%.
-# --min-winrate overrides this per-strategy default with one flat
-# number applied to both tiers alike -- see main().
+# --min-winrate overrides all three of these defaults with one flat
+# number applied alike -- see main().
 MIN_WINRATE_MULTIPLIER = 1.1
 MIN_WINRATE_FLOOR = 0.35
 
@@ -198,7 +204,13 @@ def _default_min_winrate(rr_ratio):
 
 
 STOCH_MIN_WINRATE_DEFAULT = _default_min_winrate(RR_RATIO)        # max(22.0%, 35%) = 35.0%
-LEVEL_MIN_WINRATE_DEFAULT = _default_min_winrate(LEVEL_RR_RATIO)  # max(36.7%, 35%) = 36.7%
+OB_MIN_WINRATE_DEFAULT = _default_min_winrate(LEVEL_RR_RATIO)     # max(36.7%, 35%) = 36.7%
+
+# poi_reversal's own default -- raised above the formula-derived
+# OB_MIN_WINRATE_DEFAULT (both strategies share the same 1:2 RR, so
+# the formula alone gives them the same 36.7% bar) by explicit
+# request, not by the breakeven*1.1/floor formula.
+POI_MIN_WINRATE_DEFAULT = 0.45
 
 MAGIC = 234567                  # MT5 order/position tag for this bot -- distinct from bot.py's 123456
 SAVE_DIR = "LSTM-PPO-saves-stoch-halftrend"  # separate from bot.py's LSTM-PPO-saves, see module docstring
@@ -1022,9 +1034,9 @@ class GBDTWinRateFilter:
     a trade only clears the gate once that estimate is at least the
     caller's min-winrate bar. One filter instance shared across all
     three entry strategies, but called with a different bar per
-    strategy tier -- STOCH_MIN_WINRATE_DEFAULT/LEVEL_MIN_WINRATE_DEFAULT
-    (or one flat --min-winrate override for both) -- see train_bot()/
-    test_bot().
+    strategy -- STOCH_MIN_WINRATE_DEFAULT/POI_MIN_WINRATE_DEFAULT/
+    OB_MIN_WINRATE_DEFAULT (or one flat --min-winrate override for all
+    three) -- see train_bot()/test_bot().
 
     Two differences from a plain always-on filter, per spec:
       - ready()/allows() don't gate anything until `weeks_trained`
@@ -1509,14 +1521,17 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
     except Exception as e:
         print(f"[{symbol}] Starting fresh ({e})")
 
-    # Two separate bars -- one per strategy tier's own RR -- unless
-    # --min-winrate passed one flat number for both. See
-    # STOCH_MIN_WINRATE_DEFAULT/LEVEL_MIN_WINRATE_DEFAULT.
+    # Three separate bars -- one per strategy -- unless --min-winrate
+    # passed one flat number for all three. See
+    # STOCH_MIN_WINRATE_DEFAULT/POI_MIN_WINRATE_DEFAULT/
+    # OB_MIN_WINRATE_DEFAULT.
     stoch_base_min_winrate = min_winrate if min_winrate is not None else STOCH_MIN_WINRATE_DEFAULT
-    level_base_min_winrate = min_winrate if min_winrate is not None else LEVEL_MIN_WINRATE_DEFAULT
+    poi_base_min_winrate = min_winrate if min_winrate is not None else POI_MIN_WINRATE_DEFAULT
+    ob_base_min_winrate = min_winrate if min_winrate is not None else OB_MIN_WINRATE_DEFAULT
 
     STOCH_MIN_WINRATE = gbdt.min_winrate(stoch_base_min_winrate)
-    LEVEL_MIN_WINRATE = gbdt.min_winrate(level_base_min_winrate)
+    POI_MIN_WINRATE = gbdt.min_winrate(poi_base_min_winrate)
+    OB_MIN_WINRATE = gbdt.min_winrate(ob_base_min_winrate)
 
     # Precompute everything the loop needs as plain arrays once, up
     # front, same spirit as bot.py's weekly-slice caching but simpler
@@ -1590,16 +1605,15 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
                     ob_bull_arr[i], ob_bear_arr[i],
                 )
 
-                # Which of the two bars applies depends on which
-                # strategy the candidate came from -- the stoch
-                # breakout's own (STOCH_MIN_WINRATE) vs. the two level
-                # strategies' shared one (LEVEL_MIN_WINRATE). Only
-                # meaningful once candidate != HOLD, i.e.
-                # candidate_strategy is set.
-                active_min_winrate = (
-                    STOCH_MIN_WINRATE if candidate_strategy == "stoch_breakout"
-                    else LEVEL_MIN_WINRATE
-                )
+                # Which of the three bars applies depends on which
+                # strategy the candidate came from. Only meaningful
+                # once candidate != HOLD, i.e. candidate_strategy is
+                # set.
+                active_min_winrate = {
+                    "stoch_breakout": STOCH_MIN_WINRATE,
+                    "poi_reversal": POI_MIN_WINRATE,
+                    "ob_mitigation": OB_MIN_WINRATE,
+                }.get(candidate_strategy)
 
                 if action in (BUY, SELL):
                     action = candidate if candidate != HOLD else HOLD
@@ -1734,7 +1748,8 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
                     print(f"Sharpe:          {sharpe:.2f}")
                     print(f"Sortino:         {sortino:.2f}")
                     print(f"Min WR (stoch):  {STOCH_MIN_WINRATE*100:.1f}%")
-                    print(f"Min WR (level):  {LEVEL_MIN_WINRATE*100:.1f}%")
+                    print(f"Min WR (poi):    {POI_MIN_WINRATE*100:.1f}%")
+                    print(f"Min WR (ob):     {OB_MIN_WINRATE*100:.1f}%")
                     filter_state = (
                         "ACTIVE" if gbdt.ready()
                         else f"bootstrapping ({gbdt.weeks_trained}/{WEEKS_BEFORE_FILTER} weeks)"
@@ -1773,7 +1788,8 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
                     if gbdt.fit():
                         gbdt.save()
                         STOCH_MIN_WINRATE = gbdt.min_winrate(stoch_base_min_winrate)
-                        LEVEL_MIN_WINRATE = gbdt.min_winrate(level_base_min_winrate)
+                        POI_MIN_WINRATE = gbdt.min_winrate(poi_base_min_winrate)
+                        OB_MIN_WINRATE = gbdt.min_winrate(ob_base_min_winrate)
                         print(
                             f"[{symbol}] [INFO] GBDT filter refit on "
                             f"{len(gbdt.X)} trades and saved"
@@ -1841,14 +1857,17 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
     gbdt = GBDTWinRateFilter(tag)
     gbdt.load()
 
-    # Two separate bars -- one per strategy tier's own RR -- unless
-    # --min-winrate passed one flat number for both. See
-    # STOCH_MIN_WINRATE_DEFAULT/LEVEL_MIN_WINRATE_DEFAULT.
+    # Three separate bars -- one per strategy -- unless --min-winrate
+    # passed one flat number for all three. See
+    # STOCH_MIN_WINRATE_DEFAULT/POI_MIN_WINRATE_DEFAULT/
+    # OB_MIN_WINRATE_DEFAULT.
     stoch_base_min_winrate = min_winrate if min_winrate is not None else STOCH_MIN_WINRATE_DEFAULT
-    level_base_min_winrate = min_winrate if min_winrate is not None else LEVEL_MIN_WINRATE_DEFAULT
+    poi_base_min_winrate = min_winrate if min_winrate is not None else POI_MIN_WINRATE_DEFAULT
+    ob_base_min_winrate = min_winrate if min_winrate is not None else OB_MIN_WINRATE_DEFAULT
 
     STOCH_MIN_WINRATE = gbdt.min_winrate(stoch_base_min_winrate)
-    LEVEL_MIN_WINRATE = gbdt.min_winrate(level_base_min_winrate)
+    POI_MIN_WINRATE = gbdt.min_winrate(poi_base_min_winrate)
+    OB_MIN_WINRATE = gbdt.min_winrate(ob_base_min_winrate)
 
     # ==========================================================
     # INITIAL LOAD
@@ -1973,12 +1992,13 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
             poi_bull, poi_bear, ob_bull, ob_bear,
         )
 
-        # Which of the two bars applies depends on which strategy the
+        # Which of the three bars applies depends on which strategy the
         # candidate came from -- see train_bot()'s same logic.
-        active_min_winrate = (
-            STOCH_MIN_WINRATE if candidate_strategy == "stoch_breakout"
-            else LEVEL_MIN_WINRATE
-        )
+        active_min_winrate = {
+            "stoch_breakout": STOCH_MIN_WINRATE,
+            "poi_reversal": POI_MIN_WINRATE,
+            "ob_mitigation": OB_MIN_WINRATE,
+        }.get(candidate_strategy)
 
         if action in (BUY, SELL):
             action = candidate if candidate != HOLD else HOLD
@@ -2062,13 +2082,13 @@ def main():
         "--min-winrate", type=float, default=None, dest="min_winrate",
         help=(
             "GBDT win-rate filter threshold, for both --train and --test. "
-            "Default (omit this flag): computed per strategy tier as "
-            "breakeven*1.1 floored at 35%% -- "
+            "Default (omit this flag): "
             f"{STOCH_MIN_WINRATE_DEFAULT*100:.1f}%% for the 1:4 RR stoch/%%R "
-            f"breakout, {LEVEL_MIN_WINRATE_DEFAULT*100:.1f}%% for the two "
-            "1:2 RR PDH/PDL/Asia + OB level strategies (see "
-            "_default_min_winrate()). Pass a value here to use one flat "
-            "number for both tiers instead. Either way, "
+            f"breakout (breakeven*1.1 floored at 35%%), "
+            f"{POI_MIN_WINRATE_DEFAULT*100:.1f}%% for the 1:2 RR PDH/PDL/Asia "
+            f"reversal, {OB_MIN_WINRATE_DEFAULT*100:.1f}%% for the 1:2 RR OB "
+            "mitigation strategy. Pass a value here to use one flat number "
+            "for all three instead. Either way, "
             "GBDTWinRateFilter.min_winrate() may still raise it further "
             "once the filter's sample buffer saturates (elevated_min_winrate)."
         )
