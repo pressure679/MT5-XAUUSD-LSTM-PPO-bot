@@ -2064,7 +2064,7 @@ def main():
             "GBDT win-rate filter threshold, for both --train and --test. "
             "Default (omit this flag): computed per strategy tier as "
             "breakeven*1.1 floored at 35%% -- "
-            f"{STOCH_MIN_WINRATE_DEFAULT*100:.1f}%% for the 1:4 RR stoch/%R "
+            f"{STOCH_MIN_WINRATE_DEFAULT*100:.1f}%% for the 1:4 RR stoch/%%R "
             f"breakout, {LEVEL_MIN_WINRATE_DEFAULT*100:.1f}%% for the two "
             "1:2 RR PDH/PDL/Asia + OB level strategies (see "
             "_default_min_winrate()). Pass a value here to use one flat "
