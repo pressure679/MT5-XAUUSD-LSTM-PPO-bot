@@ -216,7 +216,7 @@ resolved.
 ```bash
 python bot_v2.py --train                                # train against historical data
 python bot_v2.py --test --symbol XAUUSD-STDc --risk 0.01 # trade live via MT5
-python bot_v2.py --train --test --risk 0.02 --htf-mode both
+python bot_v2.py --train --test --risk 0.02 --htf-mode both --min-winrate 0.4
 ```
 
 ### Strategy 1 — stoch/%R zone-breakout (1:4 RR)
@@ -306,8 +306,11 @@ during `train_bot()`.
 ### Risk sizing
 
 A buy/sell from any of the three strategies only clears the GBDT win-rate filter once
-it predicts a win rate at or above `BASE_MIN_WINRATE` (35%, flat — well above either
-strategy tier's own RR-implied breakeven).
+it predicts a win rate at or above the min-winrate bar — `BASE_MIN_WINRATE` by default
+(35%, flat — well above either strategy tier's own RR-implied breakeven), overridable
+with `--min-winrate` for both `--train` and `--test` (e.g. `--min-winrate 0.4`). One
+shared bar, applied the same way to the 1:4 RR stoch/%R breakout and the two 1:2 RR
+level strategies alike — not tiered per RR.
 
 Position risk scales with the filter's confidence: once active, every full 10
 percentage points its predicted win rate clears above that minimum adds one more unit

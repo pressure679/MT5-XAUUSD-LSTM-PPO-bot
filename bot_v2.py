@@ -76,9 +76,12 @@ strategy's TP), the agent only decides timing. Actions are 0=buy,
 
 GBDT (XGBoost) win-rate filter -- GBDTWinRateFilter, shared across all
 three strategies (one filter, one feature vector covering every
-strategy's signals) -- has to predict a win rate clearing
-BASE_MIN_WINRATE (35%) before a buy/sell from any strategy is allowed
-through. The filter only starts *gating* trades once 5 simulated
+strategy's signals, one --min-winrate bar applied the same way to the
+1:4 RR stoch/%R breakout and the two 1:2 RR level strategies alike, not
+tiered per RR) -- has to predict a win rate clearing that bar
+(BASE_MIN_WINRATE, 35% by default; override with --min-winrate for
+both --train and --test) before a buy/sell from any strategy is
+allowed through. The filter only starts *gating* trades once 5 simulated
 training weeks have accumulated (WEEKS_BEFORE_FILTER) -- before that it
 keeps fitting/accumulating samples in the background but never blocks a
 trade, so the first weeks of training aren't starved waiting on data
@@ -998,16 +1001,19 @@ class GBDTWinRateFilter:
     """XGBoost (GBDT) win-rate filter -- every closed trade's entry-time
     feature vector + win/loss outcome is accumulated, and periodically
     refit. predict_win_rate() estimates a new setup's win probability;
-    a trade only clears the gate once that estimate is at least
-    BASE_MIN_WINRATE (a flat 35%).
+    a trade only clears the gate once that estimate is at least the
+    caller's min-winrate bar. One filter, one bar shared across all
+    three entry strategies -- not tiered per strategy/RR.
 
     Two differences from a plain always-on filter, per spec:
       - ready()/allows() don't gate anything until `weeks_trained`
         (bumped once per simulated training week in train_bot) reaches
         WEEKS_BEFORE_FILTER -- fitting/accumulating still happens the
         whole time, it just isn't *applied* until then.
-      - min_winrate()'s base is breakeven*1.1, computed by the caller
-        (BASE_MIN_WINRATE) and passed in, not hardcoded here.
+      - min_winrate()'s base bar is a plain number (BASE_MIN_WINRATE by
+        default, 35%; overridable per run via train_bot()'s/test_bot()'s
+        min_winrate= param, i.e. the --min-winrate CLI flag) computed by
+        the caller and passed in, not hardcoded here.
 
     Persisted as raw (X, y) samples (plus weeks_trained), not the fitted
     model itself, so the sample set survives an algorithm change and
@@ -1445,7 +1451,7 @@ def _select_candidate(
     return HOLD, TP_PIPS, None
 
 
-def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
+def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_WINRATE):
 
     print("Training bot (stoch/%R breakout + PDH/PDL/Asia reversal + OB mitigation)")
     start = time.perf_counter()
@@ -1483,7 +1489,7 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
     except Exception as e:
         print(f"[{symbol}] Starting fresh ({e})")
 
-    MIN_WINRATE = gbdt.min_winrate(BASE_MIN_WINRATE)
+    MIN_WINRATE = gbdt.min_winrate(min_winrate)
 
     # Precompute everything the loop needs as plain arrays once, up
     # front, same spirit as bot.py's weekly-slice caching but simpler
@@ -1727,7 +1733,7 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
                     gbdt.weeks_trained += 1
                     if gbdt.fit():
                         gbdt.save()
-                        MIN_WINRATE = gbdt.min_winrate(BASE_MIN_WINRATE)
+                        MIN_WINRATE = gbdt.min_winrate(min_winrate)
                         print(
                             f"[{symbol}] [INFO] GBDT filter refit on "
                             f"{len(gbdt.X)} trades and saved"
@@ -1777,7 +1783,7 @@ def _rename_mt5_rates(d):
     return d[["Open", "High", "Low", "Close"]]
 
 
-def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
+def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_WINRATE):
 
     if mt5 is None:
         raise RuntimeError(
@@ -1794,7 +1800,7 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
 
     gbdt = GBDTWinRateFilter(tag)
     gbdt.load()
-    MIN_WINRATE = gbdt.min_winrate(BASE_MIN_WINRATE)
+    MIN_WINRATE = gbdt.min_winrate(min_winrate)
 
     # ==========================================================
     # INITIAL LOAD
@@ -1997,6 +2003,19 @@ def main():
             "to agree with its direction. 'both': needs both."
         )
     )
+    parser.add_argument(
+        "--min-winrate", type=float, default=BASE_MIN_WINRATE, dest="min_winrate",
+        help=(
+            "GBDT win-rate filter threshold (default "
+            f"{BASE_MIN_WINRATE:.2f} = {BASE_MIN_WINRATE*100:.0f}%%). Applies "
+            "as one shared function across all three entry strategies -- the "
+            "1:4 RR stoch/%R breakout and the two 1:2 RR PDH/PDL/Asia + OB "
+            "level strategies alike, not tiered per RR -- and to both "
+            "--train and --test (GBDTWinRateFilter.min_winrate() may still "
+            "raise it further once the filter's sample buffer saturates; "
+            "see BASE_MIN_WINRATE / elevated_min_winrate)."
+        )
+    )
 
     args = parser.parse_args()
 
@@ -2008,7 +2027,10 @@ def main():
     if args.train:
         p = multiprocessing.Process(
             target=train_bot,
-            kwargs=dict(symbol=args.symbol, risk=args.risk, htf_mode=args.htf_mode),
+            kwargs=dict(
+                symbol=args.symbol, risk=args.risk, htf_mode=args.htf_mode,
+                min_winrate=args.min_winrate,
+            ),
             daemon=True
         )
         p.start()
@@ -2017,7 +2039,10 @@ def main():
     if args.test:
         p = multiprocessing.Process(
             target=test_bot,
-            kwargs=dict(symbol=args.symbol, risk=args.risk, htf_mode=args.htf_mode),
+            kwargs=dict(
+                symbol=args.symbol, risk=args.risk, htf_mode=args.htf_mode,
+                min_winrate=args.min_winrate,
+            ),
             daemon=True
         )
         p.start()
