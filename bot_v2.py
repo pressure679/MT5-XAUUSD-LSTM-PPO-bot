@@ -1,73 +1,102 @@
 """
-bot_v2.py -- LSTM-PPO XAUUSD trading bot, stochastic/%R zone-breakout +
-1h/4h HalfTrend variant.
+bot_v2.py -- LSTM-PPO XAUUSD trading bot: three entry strategies sharing
+one agent, one GBDT win-rate filter, one 1m execution loop.
 
-A second, independent strategy alongside bot.py's ICT/SMC bot, built the
-same way bot.py itself is: it *executes* bar-by-bar on 1-minute candles
-(order fills, SL/TP hit detection all happen at 1m granularity) but
-*analyzes* higher timeframes -- every 1m row sees the full indicator +
-entry-signal stack recomputed on 5m, 15m, 1h and 4h candles resampled
-from that same 1m data, merged back on with a 5m_/15m_/1h_/4h_ prefix
-(forward-filled, so a bar only ever sees the most recently *closed*
-higher-tf candle -- no lookahead). This is exactly bot.py's own
-multi-timeframe merge (see its add_indicators()), just run across four
+A second, independent strategy set alongside bot.py's ICT/SMC bot, built
+the same way bot.py itself is: it *executes* bar-by-bar on 1-minute
+candles (order fills, SL/TP hit detection all happen at 1m granularity)
+but *analyzes* higher timeframes -- every 1m row sees the full indicator
++ entry-signal stack recomputed on 5m, 15m, 1h and 4h candles resampled
+from that same 1m data (merged back on with a 5m_/15m_/1h_/4h_ prefix,
+forward-filled so a bar only ever sees the most recently *closed*
+higher-tf candle -- no lookahead), plus a second stack computed directly
+on the 1m data itself (prefixed 1m_). This is exactly bot.py's own
+multi-timeframe merge (see its add_indicators()), just run across five
 timeframes instead of two, and with a much smaller indicator stack per
-timeframe:
+timeframe. On any bar, at most one of the three strategies below can
+produce a candidate trade -- see _select_candidate() for the priority
+order used when more than one would fire at once.
 
-  Per analyzed timeframe (5m/15m/1h/4h) -- see _add_base_indicators():
+STRATEGY 1 -- stoch/%R zone-breakout (see _add_base_indicators(),
+_signal_columns()), 1:4 RR (50-pip SL / 200-pip TP = TP_PIPS):
+
+  Per analyzed timeframe (5m/15m/1h/4h):
     - EMA 7 / 21, each vs. price (distance) and its own slope
     - HalfTrend (bullish/bearish), plus its own distance from price
     - ADX (+DI/-DI) as a trend-strength floor
-    - Stochastic oscillator (%K / %K-smooth)
-    - Williams %R
-    - The stoch/%R zone-breakout entry signal (see below)
+    - Stochastic oscillator (%K / %K-smooth) and Williams %R
+    - The stoch/%R zone-breakout entry signal (below)
 
-  Entry gate ("stoch_r_zone_breakout" below), evaluated independently
-  on each of the 4 analyzed timeframes:
-    A bar counts as oversold once %K < 20 OR %R < -80, overbought once
-    %K > 80 OR %R > -20. Once either state has held for ZONE_BARS (=5)
-    consecutive bars *of that timeframe*, that run's high/low forms a
-    "zone" -- a breakout above the zone high (confirmed by %K crossing
-    back above %K-smooth) is a bullish signal; a breakdown below the
-    zone low (%K crossing back below %K-smooth) is bearish. A candidate
-    trade fires whenever ANY of the 4 timeframes signals a breakout
-    (with that timeframe's own ADX clearing ADX_MIN) -- this is one
-    reasonable reading of "stoch k </> k smooth, and/or %r, wait 5
-    candles in ob/os zone, then breakout, executed on 5m/15m/1h/4h" --
-    adjust the thresholds/combination logic below if a different
-    reading was intended.
+  A bar counts as oversold once %K < 20 OR %R < -80, overbought once
+  %K > 80 OR %R > -20. Once either state has held for ZONE_BARS (=5)
+  consecutive bars *of that timeframe*, that run's high/low forms a
+  "zone" -- a breakout above the zone high (confirmed by %K crossing
+  back above %K-smooth) is bullish; a breakdown below the zone low (%K
+  crossing back below %K-smooth) is bearish. A candidate fires whenever
+  ANY of the 4 timeframes signals a breakout with that timeframe's own
+  ADX clearing ADX_MIN. Direction filter: only becomes a trade if the
+  1h and/or 4h HalfTrend agrees (--htf-mode "any"/"both"). This is one
+  reasonable reading of "stoch k </> k smooth, and/or %r, wait 5
+  candles in ob/os zone, then breakout, executed on 5m/15m/1h/4h, only
+  in direction with 1h and/or 4h halftrend" -- adjust the thresholds
+  or _signal_columns()'s combination logic if a different reading was
+  intended.
 
-  Direction filter: a breakout candidate only becomes a trade if the 1h
-  and/or 4h HalfTrend agrees with its direction -- see --htf-mode
-  ("any" = one of the two agrees, "both" = both must). The bot never
-  trades against both.
+STRATEGIES 2 & 3 -- both computed directly on the 1m data itself (see
+_add_m1_levels(), _level_signal_columns()), sharing a 1:2 RR (the same
+50-pip SL / a 100-pip TP = LEVEL_TP_PIPS), and both gated by 1m
+HalfTrend:
 
-  The LSTM-PPO agent then decides whether to actually take a candidate
-  signal (or hold) -- same "agent times entries, deterministic stack
-  picks direction" split bot.py's own HalfTrend-redirect uses. Actions
-  are 0=buy, 1=sell, 2=hold (BUY/SELL/HOLD below), per spec.
+  2. PDH/PDL + Asia high/low break, retest and reversal (poi_reversal):
+     a candidate fires in whichever direction the 1m HalfTrend
+     currently points, on any bar where price is within
+     POI_REACH_PIPS (30) of the previous day's high, the previous
+     day's low, the current Asia session's high, or its low (PDH/PDL/
+     Asia-high/Asia-low distance, ported from bot.py's own
+     PDHDistance/PDLDistance/AsiaHighDistance/AsiaLowDistance).
+     HalfTrend's live state stands in for whichever of
+     breakout/retest/reversal is actually happening at the level --
+     continuing through it trades as a breakout, flipping at it trades
+     as a reversal -- rather than classifying the three separately.
 
-  Risk/reward is fixed at 1:4 -- a 50-pip stop, 200-pip target
-  (SL_PIPS / RR_RATIO below). Before a buy/sell is allowed through, a
-  GBDT (XGBoost) win-rate filter -- GBDTWinRateFilter -- has to predict
-  a win rate clearing BASE_MIN_WINRATE (35%). The filter only starts
-  *gating* trades once 5 simulated training
-  weeks have accumulated (WEEKS_BEFORE_FILTER) -- before that it keeps
-  fitting/accumulating samples in the background but never blocks a
-  trade, so the first weeks of training aren't starved waiting on data
-  that doesn't exist yet.
+  3. OB mitigation (ob_mitigation): a candidate fires when the 1m
+     HalfTrend *flips* direction (not just agrees) on a bar that's
+     also mitigating -- within the same POI_REACH_PIPS reach, via
+     OBMitigation(), ported from bot.py's own BullishOB/BearishOB/
+     OBMitigation -- a same-direction order block: a bullish/demand OB
+     mitigated with HalfTrend flipping up is a reversal long, a
+     bearish/supply OB mitigated with HalfTrend flipping down is a
+     reversal short.
 
-  Position risk scales with the filter's confidence: once it's active,
-  every full 10 percentage points its predicted win rate clears above
-  the minimum bar adds one more unit of the base --risk to the
-  position (risk_multiplier() below) -- so a barely-qualifying setup
-  risks the plain --risk amount, a strongly-favoured one risks several
-  multiples of it (capped at MAX_RISK_MULTIPLIER).
+Across all three strategies, the LSTM-PPO agent decides whether to
+actually take whichever candidate wins (or hold) -- the deterministic
+technical stack always picks direction (and which strategy, and that
+strategy's TP), the agent only decides timing. Actions are 0=buy,
+1=sell, 2=hold (BUY/SELL/HOLD below), per spec.
 
-  Weekly stats (trade count, PnL, R-multiple, win rate, mean win/loss,
-  streaks, Z-score, profit factor, recovery factor, Sharpe, Sortino,
-  GBDT filter state) print every simulated training week, same cadence
-  and same metrics as bot.py's own weekly report.
+GBDT (XGBoost) win-rate filter -- GBDTWinRateFilter, shared across all
+three strategies (one filter, one feature vector covering every
+strategy's signals) -- has to predict a win rate clearing
+BASE_MIN_WINRATE (35%) before a buy/sell from any strategy is allowed
+through. The filter only starts *gating* trades once 5 simulated
+training weeks have accumulated (WEEKS_BEFORE_FILTER) -- before that it
+keeps fitting/accumulating samples in the background but never blocks a
+trade, so the first weeks of training aren't starved waiting on data
+that doesn't exist yet.
+
+Position risk scales with the filter's confidence: once it's active,
+every full 10 percentage points its predicted win rate clears above the
+minimum bar adds one more unit of the base --risk to the position
+(risk_multiplier() below) -- so a barely-qualifying setup risks the
+plain --risk amount, a strongly-favoured one risks several multiples of
+it (capped at MAX_RISK_MULTIPLIER).
+
+Weekly stats (trade count, PnL, R-multiple, win rate, mean win/loss,
+streaks, Z-score, profit factor, recovery factor, Sharpe, Sortino, GBDT
+filter state, and a trades-by-strategy breakdown) print every simulated
+training week, same cadence and metrics as bot.py's own weekly report
+(plus the strategy breakdown, which bot.py's single-strategy report has
+no need for).
 
 Checkpoints and the GBDT filter's sample pickle are saved under a
 directory + tag distinct from bot.py's (SAVE_DIR / model_tag()) so the
@@ -139,6 +168,16 @@ BASE_MIN_WINRATE = 0.35
 
 RISK_STEP = 0.10                # +10 predicted-win-rate points
 MAX_RISK_MULTIPLIER = 5.0       # cap on how many multiples of --risk one trade can size to
+
+# --- PDH/PDL + Asia high/low reversal strategy, and OB-mitigation
+# strategy -- see _add_m1_levels()/_level_signal_columns() below. Both
+# share the same 50-pip SL (SL_PIPS above) but trade a 1:2 RR, half
+# the stoch-breakout strategy's 1:4.
+LEVEL_RR_RATIO = 2.0
+LEVEL_TP_PIPS = SL_PIPS * LEVEL_RR_RATIO  # 100-pip target
+POI_REACH_PIPS = 30             # "within 30 pips of poi" -- shared by both level-based strategies
+OB_MULTIPLIER = 1.5             # bot.py's BullishOB/BearishOB impulse-candle size multiplier
+OB_LOOKBACK = 72                # bot.py's OBMitigation() lookback, in bars
 
 MAGIC = 234567                  # MT5 order/position tag for this bot -- distinct from bot.py's 123456
 SAVE_DIR = "LSTM-PPO-saves-stoch-halftrend"  # separate from bot.py's LSTM-PPO-saves, see module docstring
@@ -350,6 +389,177 @@ def stoch_r_zone_breakout(df, zone_bars=ZONE_BARS):
 
 
 # ==========================================================================
+# LEVEL / ORDER-BLOCK INDICATORS -- ported from bot.py, for the PDH/PDL
+# + Asia high/low reversal strategy and the OB-mitigation strategy
+# below (both gated by 1m HalfTrend, computed via _add_m1_levels()).
+# ==========================================================================
+
+def GetRange(df):
+    """Candle range in pips -- bot.py's own convention,
+    (High-Low)*10, i.e. already pip units given PIP_VALUE=0.1."""
+    return (df["High"] - df["Low"]) * 10
+
+
+def RangeMA(df, period=14):
+    """Rolling mean of df["range"] (GetRange()). Ported from bot.py's
+    RangeMA()."""
+    return round(df["range"].rolling(period).mean(), 2)
+
+
+def BullishOB(df, multiplier=OB_MULTIPLIER):
+    """Bullish (demand) order block: the last down-candle before an
+    up-candle at least `multiplier`x its size, with the down-candle's
+    own body bigger than the recent average range. Ported verbatim
+    from bot.py's BullishOB(). Requires df["range_ma"] (GetRange() +
+    RangeMA()) to already be set."""
+    body = (df["Close"] - df["Open"]).abs()
+    next_body = body.shift(-1)
+
+    bearish = df["Close"] < df["Open"]
+    next_bullish = df["Close"].shift(-1) > df["Open"].shift(-1)
+
+    return (
+        bearish
+        & next_bullish
+        & (body > df["range_ma"])
+        & (next_body >= body * multiplier)
+    ).astype(int)
+
+
+def BearishOB(df, multiplier=OB_MULTIPLIER):
+    """Bearish (supply) order block -- mirror of BullishOB(). Ported
+    verbatim from bot.py's BearishOB()."""
+    body = (df["Close"] - df["Open"]).abs()
+    next_body = body.shift(-1)
+
+    bullish = df["Close"] > df["Open"]
+    next_bearish = df["Close"].shift(-1) < df["Open"].shift(-1)
+
+    return (
+        bullish
+        & next_bearish
+        & (body > df["range_ma"])
+        & (next_body >= body * multiplier)
+    ).astype(int)
+
+
+def OBMitigation(df, threshold_pips=POI_REACH_PIPS, lookback=OB_LOOKBACK):
+    """True on any bar within `threshold_pips` of a prior order
+    block's own candle low/high (not the binary bullish_ob/bearish_ob
+    flag itself, which isn't a price level). Same algorithm as bot.py's
+    OBMitigation(), adapted to take its threshold in pips -- bot.py's
+    own version takes a raw-price threshold (its default of 30 is
+    literally $30, i.e. 300 pips at PIP_VALUE=0.1); this version's
+    default of 30 is genuinely 30 pips, per spec ("same 30 pip
+    reach")."""
+    threshold = threshold_pips * PIP_VALUE
+
+    high = df["High"].to_numpy()
+    low = df["Low"].to_numpy()
+
+    bullish_ob = df["bullish_ob"].to_numpy().astype(bool)
+    bearish_ob = df["bearish_ob"].to_numpy().astype(bool)
+
+    bull = np.zeros(len(df), dtype=np.bool_)
+    bear = np.zeros(len(df), dtype=np.bool_)
+
+    n = len(df)
+
+    for i in range(n):
+        start = max(0, i - lookback)
+
+        for j in range(i - 1, start - 1, -1):
+            if bullish_ob[j] and abs(low[i] - low[j]) <= threshold:
+                bull[i] = True
+                break
+
+        for j in range(i - 1, start - 1, -1):
+            if bearish_ob[j] and abs(high[i] - high[j]) <= threshold:
+                bear[i] = True
+                break
+
+    return bull, bear
+
+
+def PDHDistance(df):
+    """Previous day's high minus current close, in raw price. Ported
+    verbatim from bot.py's PDHDistance(). Requires a DatetimeIndex."""
+    day = df.index.date
+
+    daily_high = df["High"].groupby(day).transform("max")
+
+    pdh = (
+        daily_high
+        .groupby(day)
+        .first()
+        .shift(1)
+        .reindex(day)
+        .to_numpy()
+    )
+
+    return pdh - df["Close"]
+
+
+def PDLDistance(df):
+    """Current close minus previous day's low, in raw price. Ported
+    verbatim from bot.py's PDLDistance()."""
+    day = df.index.date
+
+    daily_low = df["Low"].groupby(day).transform("min")
+
+    pdl = (
+        daily_low
+        .groupby(day)
+        .first()
+        .shift(1)
+        .reindex(day)
+        .to_numpy()
+    )
+
+    return df["Close"] - pdl
+
+
+def AsiaHighDistance(df):
+    """Current Asia session's high minus current close, in raw price.
+    Adapted from bot.py's AsiaHighDistance(): its session mask,
+    `(hour >= 1) | (hour <= 9)`, is a bug (that OR covers nearly the
+    entire day, not a session) -- this uses AND, matching that
+    function's own "01:00-08:59" docstring and bot.py's GetKillzone()
+    asia-session convention."""
+    asia = (df.index.hour >= 1) & (df.index.hour < 9)
+
+    trade_day = (df.index - pd.Timedelta(hours=24)).date
+
+    asia_high = (
+        df["High"]
+        .where(asia)
+        .groupby(trade_day)
+        .transform("max")
+        .ffill()
+    )
+
+    return asia_high - df["Close"]
+
+
+def AsiaLowDistance(df):
+    """Current close minus current Asia session's low, in raw price.
+    Same OR->AND session-mask fix as AsiaHighDistance() above."""
+    asia = (df.index.hour >= 1) & (df.index.hour < 9)
+
+    trade_day = (df.index - pd.Timedelta(hours=24)).date
+
+    asia_low = (
+        df["Low"]
+        .where(asia)
+        .groupby(trade_day)
+        .transform("min")
+        .ffill()
+    )
+
+    return df["Close"] - asia_low
+
+
+# ==========================================================================
 # FEATURE PIPELINE
 # ==========================================================================
 
@@ -375,11 +585,22 @@ ANALYZED_TIMEFRAMES = (
     ("4h", "4h"),
 )
 
+# The indicator stack computed directly on the raw 1m execution data
+# itself (never resampled) -- see _add_m1_levels() -- feeding the
+# PDH/PDL + Asia high/low reversal strategy and the OB-mitigation
+# strategy, both gated by this same 1m HalfTrend.
+M1_LEVEL_FEATURES = [
+    "bullish_halftrend", "bearish_halftrend",
+    "bullish_ob", "bearish_ob",
+    "bullish_ob_mitigation", "bearish_ob_mitigation",
+    "pdh_dist", "pdl_dist", "asia_high_dist", "asia_low_dist",
+]
+
 FEATURES = [
     f"{prefix}_{col}"
     for prefix, _ in ANALYZED_TIMEFRAMES
     for col in BASE_INDICATOR_FEATURES
-]
+] + [f"1m_{col}" for col in M1_LEVEL_FEATURES]
 
 
 def _add_base_indicators(df):
@@ -411,22 +632,56 @@ def _add_base_indicators(df):
     return df[BASE_INDICATOR_FEATURES]
 
 
+def _add_m1_levels(df):
+    """Adds M1_LEVEL_FEATURES -- HalfTrend plus the order-block and
+    PDH/PDL/Asia-session levels the two level-based strategies trade
+    off of -- directly on the raw 1m execution data. Unlike
+    _add_base_indicators() (run on a resampled higher-tf copy and
+    merged back with a lag), this runs on the same 1m frame the bot
+    executes on, so every value is already "live" at the bar it's
+    computed on -- no forward-fill needed."""
+    df = df.copy()
+
+    df["bullish_halftrend"], df["bearish_halftrend"], _ = HalfTrend(df)
+
+    df["range"] = GetRange(df)
+    df["range_ma"] = RangeMA(df)
+    df["bullish_ob"] = BullishOB(df)
+    df["bearish_ob"] = BearishOB(df)
+    df["bullish_ob_mitigation"], df["bearish_ob_mitigation"] = OBMitigation(df)
+
+    df["pdh_dist"] = PDHDistance(df) / PIP_VALUE
+    df["pdl_dist"] = PDLDistance(df) / PIP_VALUE
+    df["asia_high_dist"] = AsiaHighDistance(df) / PIP_VALUE
+    df["asia_low_dist"] = AsiaLowDistance(df) / PIP_VALUE
+
+    return df[M1_LEVEL_FEATURES]
+
+
 def add_indicators(df):
     """df must be raw 1-minute OHLC candles (Open/High/Low/Close). The
     bot executes at this same 1m granularity (bar-by-bar SL/TP
-    tracking, order fills) -- same execution model as bot.py -- but no
-    indicators are computed on the 1m data itself. Instead, each of
-    ANALYZED_TIMEFRAMES (5m/15m/1h/4h) is resampled from it
-    (right-labeled/left-closed, so a bin is only visible once it has
-    actually closed), the full indicator + zone-breakout stack
-    (_add_base_indicators) runs on that resampled frame, and the
-    result is merged back onto every 1m row -- prefixed
-    5m_/15m_/1h_/4h_, forward-filled so a bar only ever sees the most
-    recently *closed* higher-tf candle. Same no-lookahead
-    multi-timeframe merge bot.py's own add_indicators() uses, just run
-    across four timeframes instead of two."""
+    tracking, order fills) -- same execution model as bot.py.
+
+    Two kinds of indicators get merged onto every 1m row:
+      - M1_LEVEL_FEATURES (_add_m1_levels): computed directly on the
+        1m data itself -- HalfTrend, order blocks/mitigation, PDH/PDL
+        and Asia high/low distance -- prefixed 1m_.
+      - BASE_INDICATOR_FEATURES (_add_base_indicators): computed on
+        each of ANALYZED_TIMEFRAMES (5m/15m/1h/4h) resampled from this
+        same 1m data (right-labeled/left-closed, so a bin is only
+        visible once it has actually closed), then merged back
+        forward-filled so a bar only ever sees the most recently
+        *closed* higher-tf candle -- prefixed 5m_/15m_/1h_/4h_. Same
+        no-lookahead multi-timeframe merge bot.py's own
+        add_indicators() uses, just run across four timeframes instead
+        of two.
+    """
 
     result = df[["Open", "High", "Low", "Close"]].copy()
+
+    m1_levels = _add_m1_levels(df).add_prefix("1m_")
+    result = pd.concat([result, m1_levels], axis=1)
 
     for prefix, freq in ANALYZED_TIMEFRAMES:
 
@@ -1121,14 +1376,83 @@ def _signal_columns(df):
     return bull_signal, bear_signal
 
 
+def _level_signal_columns(df):
+    """Candidate signals for the two 1m-HalfTrend-gated level
+    strategies (both need M1_LEVEL_FEATURES from _add_m1_levels()):
+
+    - poi_bull/poi_bear ("PDH/PDL + Asia high/low break, retest and
+      reversal"): the 1m HalfTrend's current direction, on any bar
+      where price is within POI_REACH_PIPS of any of the four levels
+      (PDH, PDL, Asia high, Asia low). HalfTrend's live state stands in
+      for whichever of breakout/retest/reversal is actually happening
+      at the level -- continuing through it trades as a breakout,
+      flipping at it trades as a reversal -- rather than classifying
+      the three separately.
+    - ob_bull/ob_bear ("OB mitigation"): the 1m HalfTrend *flipping*
+      direction this bar (not just agreeing, per spec's "halftrend
+      reversal") on a bar that's also mitigating (within
+      POI_REACH_PIPS of, via OBMitigation()'s own threshold) a
+      same-direction order block -- a bullish/demand OB mitigated with
+      HalfTrend flipping up is a reversal long, a bearish/supply OB
+      mitigated with HalfTrend flipping down is a reversal short.
+    """
+    bull_ht = df["1m_bullish_halftrend"].astype(bool)
+    bear_ht = df["1m_bearish_halftrend"].astype(bool)
+
+    near_poi = (
+        (df["1m_pdh_dist"].abs() <= POI_REACH_PIPS)
+        | (df["1m_pdl_dist"].abs() <= POI_REACH_PIPS)
+        | (df["1m_asia_high_dist"].abs() <= POI_REACH_PIPS)
+        | (df["1m_asia_low_dist"].abs() <= POI_REACH_PIPS)
+    )
+
+    poi_bull = bull_ht & near_poi
+    poi_bear = bear_ht & near_poi
+
+    flip_bull = bull_ht & ~bull_ht.shift(1).fillna(False)
+    flip_bear = bear_ht & ~bear_ht.shift(1).fillna(False)
+
+    ob_bull = flip_bull & df["1m_bullish_ob_mitigation"].astype(bool)
+    ob_bear = flip_bear & df["1m_bearish_ob_mitigation"].astype(bool)
+
+    return poi_bull, poi_bear, ob_bull, ob_bear
+
+
+def _select_candidate(
+    bull_stoch, bear_stoch, long_htf_ok, short_htf_ok,
+    poi_bull, poi_bear, ob_bull, ob_bear,
+):
+    """Picks a candidate (action, tp_pips, strategy_name) for the
+    current bar across all three entry strategies, in a fixed priority
+    order: stoch/%R zone-breakout first, then the PDH/PDL/Asia-level
+    reversal, then OB mitigation. More than one firing on the same bar
+    (in the same or opposite directions) is rare given how differently
+    each triggers, and resolved by this order rather than reconciled --
+    the agent still decides whether to actually take whatever candidate
+    wins. Returns (HOLD, TP_PIPS, None) if nothing fires."""
+    if bull_stoch and long_htf_ok:
+        return BUY, TP_PIPS, "stoch_breakout"
+    if bear_stoch and short_htf_ok:
+        return SELL, TP_PIPS, "stoch_breakout"
+    if poi_bull:
+        return BUY, LEVEL_TP_PIPS, "poi_reversal"
+    if poi_bear:
+        return SELL, LEVEL_TP_PIPS, "poi_reversal"
+    if ob_bull:
+        return BUY, LEVEL_TP_PIPS, "ob_mitigation"
+    if ob_bear:
+        return SELL, LEVEL_TP_PIPS, "ob_mitigation"
+    return HOLD, TP_PIPS, None
+
+
 def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
 
-    print("Training bot (stoch/%R zone-breakout + 1h/4h HalfTrend)")
+    print("Training bot (stoch/%R breakout + PDH/PDL/Asia reversal + OB mitigation)")
     start = time.perf_counter()
 
     TRAIN_HISTORY_MB = 20
     df_m1 = load_last_mb_xauusd(mb=TRAIN_HISTORY_MB)
-    print(f"Computing 5m/15m/1h/4h indicators over 1m execution data... ({time.strftime('%H:%M')})")
+    print(f"Computing 1m/5m/15m/1h/4h indicators over 1m execution data... ({time.strftime('%H:%M')})")
     df = add_indicators(df_m1)
     elapsed = int((time.perf_counter() - start) // 60)
     print(f"Loaded indicators on {len(df)} 1m bars (Elapsed: {elapsed}m)")
@@ -1140,6 +1464,12 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
     bull_signal, bear_signal = _signal_columns(df)
     df["bull_signal"] = bull_signal
     df["bear_signal"] = bear_signal
+
+    poi_bull, poi_bear, ob_bull, ob_bear = _level_signal_columns(df)
+    df["poi_bull"] = poi_bull
+    df["poi_bear"] = poi_bear
+    df["ob_bull"] = ob_bull
+    df["ob_bear"] = ob_bear
 
     tag = model_tag(symbol)
 
@@ -1157,7 +1487,7 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
 
     # Precompute everything the loop needs as plain arrays once, up
     # front, same spirit as bot.py's weekly-slice caching but simpler
-    # since the full feature matrix here (1m bars x 68 features) is
+    # since the full feature matrix here (1m bars x 78 features) is
     # small enough to hold in memory for the whole run at once.
     feature_matrix = df[FEATURES].to_numpy(dtype=np.float32)
     close_arr = df["Close"].to_numpy()
@@ -1167,15 +1497,21 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
     bear_signal_arr = df["bear_signal"].to_numpy()
     long_htf_ok_arr = df["long_htf_ok"].to_numpy()
     short_htf_ok_arr = df["short_htf_ok"].to_numpy()
+    poi_bull_arr = df["poi_bull"].to_numpy()
+    poi_bear_arr = df["poi_bear"].to_numpy()
+    ob_bull_arr = df["ob_bull"].to_numpy()
+    ob_bear_arr = df["ob_bear"].to_numpy()
 
     save_counter = 0
     in_position = False
     position_type = None
     entry_price = sl_price = tp_price = 0.0
     entry_state = None
+    entry_strategy = None
     mult = 1.0
 
     trade_returns = []
+    strategy_counts = {"stoch_breakout": 0, "poi_reversal": 0, "ob_mitigation": 0}
     state_buffer = deque(maxlen=SEQ_LEN)
 
     loop_count = 0
@@ -1207,17 +1543,19 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
 
                 action, logprob, value = result
 
-                # Candidate direction comes from the deterministic
-                # technical stack, not the agent's own guess -- the
-                # agent's job is only deciding whether to *take* a
-                # signal that already exists (mirrors bot.py's
-                # HalfTrend-redirect: technicals pick direction, the
-                # agent times entries).
-                candidate = HOLD
-                if bull_signal_arr[i] and long_htf_ok_arr[i]:
-                    candidate = BUY
-                elif bear_signal_arr[i] and short_htf_ok_arr[i]:
-                    candidate = SELL
+                # Candidate direction (and which of the three
+                # strategies it comes from, and that strategy's own
+                # TP) comes from the deterministic technical stack, not
+                # the agent's own guess -- the agent's job is only
+                # deciding whether to *take* a signal that already
+                # exists (mirrors bot.py's HalfTrend-redirect:
+                # technicals pick direction, the agent times entries).
+                candidate, candidate_tp_pips, candidate_strategy = _select_candidate(
+                    bull_signal_arr[i], bear_signal_arr[i],
+                    long_htf_ok_arr[i], short_htf_ok_arr[i],
+                    poi_bull_arr[i], poi_bear_arr[i],
+                    ob_bull_arr[i], ob_bear_arr[i],
+                )
 
                 if action in (BUY, SELL):
                     action = candidate if candidate != HOLD else HOLD
@@ -1242,10 +1580,13 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
                     position_type = "long"
                     entry_price = current_price
                     entry_state = state.copy()
+                    entry_strategy = candidate_strategy
                     mult = risk_multiplier(predicted_wr, MIN_WINRATE)
 
                     sl_price = entry_price - SL_PIPS * PIP_VALUE
-                    tp_price = entry_price + TP_PIPS * PIP_VALUE
+                    tp_price = entry_price + candidate_tp_pips * PIP_VALUE
+
+                    strategy_counts[entry_strategy] += 1
 
                     agent.store_transition(state_seq, action, logprob, value, pnl, done)
 
@@ -1254,10 +1595,13 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
                     position_type = "short"
                     entry_price = current_price
                     entry_state = state.copy()
+                    entry_strategy = candidate_strategy
                     mult = risk_multiplier(predicted_wr, MIN_WINRATE)
 
                     sl_price = entry_price + SL_PIPS * PIP_VALUE
-                    tp_price = entry_price - TP_PIPS * PIP_VALUE
+                    tp_price = entry_price - candidate_tp_pips * PIP_VALUE
+
+                    strategy_counts[entry_strategy] += 1
 
                     agent.store_transition(state_seq, action, logprob, value, pnl, done)
 
@@ -1351,6 +1695,12 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
                         else f"bootstrapping ({gbdt.weeks_trained}/{WEEKS_BEFORE_FILTER} weeks)"
                     )
                     print(f"GBDT filter:     {filter_state}")
+                    print(
+                        f"By strategy:     "
+                        f"stoch={strategy_counts['stoch_breakout']} "
+                        f"poi={strategy_counts['poi_reversal']} "
+                        f"ob={strategy_counts['ob_mitigation']}"
+                    )
                     print("================================================")
                     print()
 
@@ -1360,6 +1710,7 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
                     )
 
                     trade_returns = []
+                    strategy_counts = {"stoch_breakout": 0, "poi_reversal": 0, "ob_mitigation": 0}
 
                     training_start = time.time()
                     print(f"[{symbol}] [INFO] Training PPO...")
@@ -1516,6 +1867,7 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
         action, logprob, value = result
 
         current = df.iloc[-1]
+        prev = df.iloc[-2]
 
         if htf_mode == "any":
             long_ok = bool(current["1h_bullish_halftrend"]) or bool(current["4h_bullish_halftrend"])
@@ -1524,10 +1876,10 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
             long_ok = bool(current["1h_bullish_halftrend"]) and bool(current["4h_bullish_halftrend"])
             short_ok = bool(current["1h_bearish_halftrend"]) and bool(current["4h_bearish_halftrend"])
 
-        # Candidate direction: ANY analyzed timeframe (5m/15m/1h/4h)
-        # signalling a zone-breakout with its own ADX clearing
-        # ADX_MIN is enough -- same _signal_columns() logic as
-        # train_bot(), evaluated on just the latest bar here.
+        # Stoch/%R breakout candidate: ANY analyzed timeframe
+        # (5m/15m/1h/4h) signalling a zone-breakout with its own ADX
+        # clearing ADX_MIN is enough -- same _signal_columns() logic
+        # as train_bot(), evaluated on just the latest bar here.
         bull_signal = any(
             bool(current[f"{prefix}_bull_breakout"]) and current[f"{prefix}_adx"] >= ADX_MIN
             for prefix, _ in ANALYZED_TIMEFRAMES
@@ -1537,11 +1889,35 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
             for prefix, _ in ANALYZED_TIMEFRAMES
         )
 
-        candidate = HOLD
-        if bull_signal and long_ok:
-            candidate = BUY
-        elif bear_signal and short_ok:
-            candidate = SELL
+        # PDH/PDL + Asia high/low reversal candidate: 1m HalfTrend's
+        # current direction within POI_REACH_PIPS of any of the four
+        # levels -- same logic as _level_signal_columns()'s poi_bull/
+        # poi_bear, evaluated on just the latest bar here.
+        bull_ht = bool(current["1m_bullish_halftrend"])
+        bear_ht = bool(current["1m_bearish_halftrend"])
+
+        near_poi = (
+            abs(current["1m_pdh_dist"]) <= POI_REACH_PIPS
+            or abs(current["1m_pdl_dist"]) <= POI_REACH_PIPS
+            or abs(current["1m_asia_high_dist"]) <= POI_REACH_PIPS
+            or abs(current["1m_asia_low_dist"]) <= POI_REACH_PIPS
+        )
+        poi_bull = bull_ht and near_poi
+        poi_bear = bear_ht and near_poi
+
+        # OB-mitigation candidate: 1m HalfTrend flipping direction this
+        # bar (not just agreeing) while also mitigating a
+        # same-direction order block -- same logic as
+        # _level_signal_columns()'s ob_bull/ob_bear.
+        flip_bull = bull_ht and not bool(prev["1m_bullish_halftrend"])
+        flip_bear = bear_ht and not bool(prev["1m_bearish_halftrend"])
+        ob_bull = flip_bull and bool(current["1m_bullish_ob_mitigation"])
+        ob_bear = flip_bear and bool(current["1m_bearish_ob_mitigation"])
+
+        candidate, candidate_tp_pips, candidate_strategy = _select_candidate(
+            bull_signal, bear_signal, long_ok, short_ok,
+            poi_bull, poi_bear, ob_bull, ob_bear,
+        )
 
         if action in (BUY, SELL):
             action = candidate if candidate != HOLD else HOLD
@@ -1582,10 +1958,13 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any"):
             lot = min(max((balance * effective_risk) / (SL_PIPS * 10), 0.01), 100.0)
             lot = round(lot, 2)
 
+            print(f"[{symbol}] Opening {ACTIONS[action]} via {candidate_strategy} "
+                  f"(TP={candidate_tp_pips:.0f} pips, lot={lot})")
+
             if action == BUY:
-                open_long(symbol, lot, SL_PIPS, TP_PIPS)
+                open_long(symbol, lot, SL_PIPS, candidate_tp_pips)
             else:
-                open_short(symbol, lot, SL_PIPS, TP_PIPS)
+                open_short(symbol, lot, SL_PIPS, candidate_tp_pips)
 
 
 # ==========================================================================
