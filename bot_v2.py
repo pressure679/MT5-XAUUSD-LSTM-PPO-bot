@@ -50,8 +50,8 @@ timeframe:
   Risk/reward is fixed at 1:4 -- a 50-pip stop, 200-pip target
   (SL_PIPS / RR_RATIO below). Before a buy/sell is allowed through, a
   GBDT (XGBoost) win-rate filter -- GBDTWinRateFilter -- has to predict
-  a win rate clearing 1.1x the breakeven rate implied by that RR (22%).
-  The filter only starts *gating* trades once 5 simulated training
+  a win rate clearing BASE_MIN_WINRATE (35%). The filter only starts
+  *gating* trades once 5 simulated training
   weeks have accumulated (WEEKS_BEFORE_FILTER) -- before that it keeps
   fitting/accumulating samples in the background but never blocks a
   trade, so the first weeks of training aren't starved waiting on data
@@ -132,7 +132,10 @@ WR_OS, WR_OB = -80, -20         # Williams %R oversold / overbought thresholds
 WEEKS_BEFORE_FILTER = 5         # GBDT win-rate filter starts gating after this many training weeks
 TRADING_WEEK_BARS = 1440 * 5    # 1m bars in a 5-day trading week -- same definition as bot.py's save_count
 
-BASE_MIN_WINRATE = (1 / (1 + RR_RATIO)) * 1.1  # breakeven (20%) * 1.1 = 22%
+# Breakeven at this 1:4 RR is 1/(1+RR_RATIO) = 20%, so the spec's
+# "breakeven * 1.1" would put this at 22% -- overridden to a flat 35%
+# per explicit request.
+BASE_MIN_WINRATE = 0.35
 
 RISK_STEP = 0.10                # +10 predicted-win-rate points
 MAX_RISK_MULTIPLIER = 5.0       # cap on how many multiples of --risk one trade can size to
@@ -741,7 +744,7 @@ class GBDTWinRateFilter:
     feature vector + win/loss outcome is accumulated, and periodically
     refit. predict_win_rate() estimates a new setup's win probability;
     a trade only clears the gate once that estimate is at least
-    BASE_MIN_WINRATE (breakeven * 1.1 for this strategy's 1:4 RR).
+    BASE_MIN_WINRATE (a flat 35%).
 
     Two differences from a plain always-on filter, per spec:
       - ready()/allows() don't gate anything until `weeks_trained`
@@ -874,7 +877,7 @@ def risk_multiplier(predicted_win_rate, min_winrate, step=RISK_STEP, max_multipl
     """"Add 1R to risk per +10% predicted win rate": every full `step`
     (default 10 points) the filter's predicted win rate clears above
     the min-winrate bar adds one more unit of the base --risk to the
-    position -- e.g. a setup predicted at 52% against a 22% bar (a
+    position -- e.g. a setup predicted at 65% against a 35% bar (a
     30-point margin) risks 1 + 3 = 4x base risk. Returns 1.0 (base risk,
     no bonus) whenever the filter isn't active yet (predicted_win_rate
     is None) or the setup only just clears the bar."""

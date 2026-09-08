@@ -262,8 +262,8 @@ reports. Printed every
 ### Risk / reward and position sizing
 
 Fixed 1:4 RR — a 50-pip stop, 200-pip target (`SL_PIPS` / `RR_RATIO`). A buy/sell only
-clears the GBDT win-rate filter once it predicts a win rate at or above breakeven × 1.1
-(`BASE_MIN_WINRATE` ≈ 22%, since breakeven at 1:4 is 20%).
+clears the GBDT win-rate filter once it predicts a win rate at or above `BASE_MIN_WINRATE`
+(35%, flat — well above the RR's own 20% breakeven).
 
 Position risk scales with the filter's confidence: once active, every full 10
 percentage points its predicted win rate clears above that minimum adds one more unit
