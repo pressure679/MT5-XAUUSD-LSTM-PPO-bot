@@ -306,11 +306,18 @@ during `train_bot()`.
 ### Risk sizing
 
 A buy/sell from any of the three strategies only clears the GBDT win-rate filter once
-it predicts a win rate at or above the min-winrate bar — `BASE_MIN_WINRATE` by default
-(35%, flat — well above either strategy tier's own RR-implied breakeven), overridable
-with `--min-winrate` for both `--train` and `--test` (e.g. `--min-winrate 0.4`). One
-shared bar, applied the same way to the 1:4 RR stoch/%R breakout and the two 1:2 RR
-level strategies alike — not tiered per RR.
+it predicts a win rate at or above a min-winrate bar. By default (no `--min-winrate`
+passed) that bar is computed **per strategy tier**, from its own RR-implied breakeven —
+`_default_min_winrate()`: `max(breakeven * 1.1, 35%)`, so a tier's requirement never
+drops below 35% but can still demand more once its own breakeven*1.1 clears that floor:
+
+| Strategy tier | RR | Breakeven | Default bar |
+|---|---|---|---|
+| stoch/%R breakout | 1:4 | 20% | **35.0%** (breakeven×1.1 = 22% doesn't clear the floor) |
+| PDH/PDL/Asia + OB mitigation | 1:2 | 33.3% | **36.7%** (breakeven×1.1 = 36.7% does) |
+
+Pass `--min-winrate` (for both `--train` and `--test`, e.g. `--min-winrate 0.4`) to use
+one flat number for both tiers instead of these computed defaults.
 
 Position risk scales with the filter's confidence: once active, every full 10
 percentage points its predicted win rate clears above that minimum adds one more unit

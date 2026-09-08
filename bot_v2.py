@@ -74,14 +74,18 @@ technical stack always picks direction (and which strategy, and that
 strategy's TP), the agent only decides timing. Actions are 0=buy,
 1=sell, 2=hold (BUY/SELL/HOLD below), per spec.
 
-GBDT (XGBoost) win-rate filter -- GBDTWinRateFilter, shared across all
-three strategies (one filter, one feature vector covering every
-strategy's signals, one --min-winrate bar applied the same way to the
-1:4 RR stoch/%R breakout and the two 1:2 RR level strategies alike, not
-tiered per RR) -- has to predict a win rate clearing that bar
-(BASE_MIN_WINRATE, 35% by default; override with --min-winrate for
-both --train and --test) before a buy/sell from any strategy is
-allowed through. The filter only starts *gating* trades once 5 simulated
+GBDT (XGBoost) win-rate filter -- GBDTWinRateFilter, one shared filter
+(one instance, one feature vector covering every strategy's signals)
+across all three strategies -- has to predict a win rate clearing a
+min-winrate bar before a buy/sell from any strategy is allowed
+through. That bar defaults to breakeven (1/(1+rr)) * 1.1, floored at
+35% (MIN_WINRATE_MULTIPLIER / MIN_WINRATE_FLOOR), computed per
+strategy tier's own RR -- STOCH_MIN_WINRATE_DEFAULT (35.0%, since the
+stoch breakout's 1:4 breakeven*1.1 of 22% doesn't clear the floor) and
+LEVEL_MIN_WINRATE_DEFAULT (36.7%, since the level strategies' 1:2
+breakeven*1.1 does) -- or, if --min-winrate is passed, one flat number
+applied the same way to both tiers instead, for both --train and
+--test. The filter only starts *gating* trades once 5 simulated
 training weeks have accumulated (WEEKS_BEFORE_FILTER) -- before that it
 keeps fitting/accumulating samples in the background but never blocks a
 trade, so the first weeks of training aren't starved waiting on data
@@ -164,11 +168,6 @@ WR_OS, WR_OB = -80, -20         # Williams %R oversold / overbought thresholds
 WEEKS_BEFORE_FILTER = 5         # GBDT win-rate filter starts gating after this many training weeks
 TRADING_WEEK_BARS = 1440 * 5    # 1m bars in a 5-day trading week -- same definition as bot.py's save_count
 
-# Breakeven at this 1:4 RR is 1/(1+RR_RATIO) = 20%, so the spec's
-# "breakeven * 1.1" would put this at 22% -- overridden to a flat 35%
-# per explicit request.
-BASE_MIN_WINRATE = 0.35
-
 RISK_STEP = 0.10                # +10 predicted-win-rate points
 MAX_RISK_MULTIPLIER = 5.0       # cap on how many multiples of --risk one trade can size to
 
@@ -181,6 +180,25 @@ LEVEL_TP_PIPS = SL_PIPS * LEVEL_RR_RATIO  # 100-pip target
 POI_REACH_PIPS = 30             # "within 30 pips of poi" -- shared by both level-based strategies
 OB_MULTIPLIER = 1.5             # bot.py's BullishOB/BearishOB impulse-candle size multiplier
 OB_LOOKBACK = 72                # bot.py's OBMitigation() lookback, in bars
+
+# Default min-winrate bar, per strategy tier: breakeven (1/(1+rr)) *
+# MIN_WINRATE_MULTIPLIER, floored at MIN_WINRATE_FLOOR so a
+# high-breakeven low-RR strategy (level strategies' 1:2 breakeven is
+# already 33.3%) is never satisfied by less than the floor, while a
+# low-breakeven high-RR strategy (the 1:4 stoch breakout's is 20%)
+# still has to clear the floor rather than its own thin 22%.
+# --min-winrate overrides this per-strategy default with one flat
+# number applied to both tiers alike -- see main().
+MIN_WINRATE_MULTIPLIER = 1.1
+MIN_WINRATE_FLOOR = 0.35
+
+
+def _default_min_winrate(rr_ratio):
+    return max((1 / (1 + rr_ratio)) * MIN_WINRATE_MULTIPLIER, MIN_WINRATE_FLOOR)
+
+
+STOCH_MIN_WINRATE_DEFAULT = _default_min_winrate(RR_RATIO)        # max(22.0%, 35%) = 35.0%
+LEVEL_MIN_WINRATE_DEFAULT = _default_min_winrate(LEVEL_RR_RATIO)  # max(36.7%, 35%) = 36.7%
 
 MAGIC = 234567                  # MT5 order/position tag for this bot -- distinct from bot.py's 123456
 SAVE_DIR = "LSTM-PPO-saves-stoch-halftrend"  # separate from bot.py's LSTM-PPO-saves, see module docstring
@@ -1002,18 +1020,20 @@ class GBDTWinRateFilter:
     feature vector + win/loss outcome is accumulated, and periodically
     refit. predict_win_rate() estimates a new setup's win probability;
     a trade only clears the gate once that estimate is at least the
-    caller's min-winrate bar. One filter, one bar shared across all
-    three entry strategies -- not tiered per strategy/RR.
+    caller's min-winrate bar. One filter instance shared across all
+    three entry strategies, but called with a different bar per
+    strategy tier -- STOCH_MIN_WINRATE_DEFAULT/LEVEL_MIN_WINRATE_DEFAULT
+    (or one flat --min-winrate override for both) -- see train_bot()/
+    test_bot().
 
     Two differences from a plain always-on filter, per spec:
       - ready()/allows() don't gate anything until `weeks_trained`
         (bumped once per simulated training week in train_bot) reaches
         WEEKS_BEFORE_FILTER -- fitting/accumulating still happens the
         whole time, it just isn't *applied* until then.
-      - min_winrate()'s base bar is a plain number (BASE_MIN_WINRATE by
-        default, 35%; overridable per run via train_bot()'s/test_bot()'s
-        min_winrate= param, i.e. the --min-winrate CLI flag) computed by
-        the caller and passed in, not hardcoded here.
+      - min_winrate()'s base bar is a plain number, computed by the
+        caller and passed in, not hardcoded here -- see
+        _default_min_winrate() and the --min-winrate CLI flag.
 
     Persisted as raw (X, y) samples (plus weeks_trained), not the fitted
     model itself, so the sample set survives an algorithm change and
@@ -1451,7 +1471,7 @@ def _select_candidate(
     return HOLD, TP_PIPS, None
 
 
-def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_WINRATE):
+def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
 
     print("Training bot (stoch/%R breakout + PDH/PDL/Asia reversal + OB mitigation)")
     start = time.perf_counter()
@@ -1489,7 +1509,14 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_W
     except Exception as e:
         print(f"[{symbol}] Starting fresh ({e})")
 
-    MIN_WINRATE = gbdt.min_winrate(min_winrate)
+    # Two separate bars -- one per strategy tier's own RR -- unless
+    # --min-winrate passed one flat number for both. See
+    # STOCH_MIN_WINRATE_DEFAULT/LEVEL_MIN_WINRATE_DEFAULT.
+    stoch_base_min_winrate = min_winrate if min_winrate is not None else STOCH_MIN_WINRATE_DEFAULT
+    level_base_min_winrate = min_winrate if min_winrate is not None else LEVEL_MIN_WINRATE_DEFAULT
+
+    STOCH_MIN_WINRATE = gbdt.min_winrate(stoch_base_min_winrate)
+    LEVEL_MIN_WINRATE = gbdt.min_winrate(level_base_min_winrate)
 
     # Precompute everything the loop needs as plain arrays once, up
     # front, same spirit as bot.py's weekly-slice caching but simpler
@@ -1563,6 +1590,17 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_W
                     ob_bull_arr[i], ob_bear_arr[i],
                 )
 
+                # Which of the two bars applies depends on which
+                # strategy the candidate came from -- the stoch
+                # breakout's own (STOCH_MIN_WINRATE) vs. the two level
+                # strategies' shared one (LEVEL_MIN_WINRATE). Only
+                # meaningful once candidate != HOLD, i.e.
+                # candidate_strategy is set.
+                active_min_winrate = (
+                    STOCH_MIN_WINRATE if candidate_strategy == "stoch_breakout"
+                    else LEVEL_MIN_WINRATE
+                )
+
                 if action in (BUY, SELL):
                     action = candidate if candidate != HOLD else HOLD
 
@@ -1575,7 +1613,7 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_W
                 predicted_wr = None
                 if action in (BUY, SELL) and gbdt.ready():
                     predicted_wr = gbdt.predict_win_rate(state)
-                    if predicted_wr < MIN_WINRATE:
+                    if predicted_wr < active_min_winrate:
                         action = HOLD
 
                 pnl = 0.0
@@ -1587,7 +1625,7 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_W
                     entry_price = current_price
                     entry_state = state.copy()
                     entry_strategy = candidate_strategy
-                    mult = risk_multiplier(predicted_wr, MIN_WINRATE)
+                    mult = risk_multiplier(predicted_wr, active_min_winrate)
 
                     sl_price = entry_price - SL_PIPS * PIP_VALUE
                     tp_price = entry_price + candidate_tp_pips * PIP_VALUE
@@ -1602,7 +1640,7 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_W
                     entry_price = current_price
                     entry_state = state.copy()
                     entry_strategy = candidate_strategy
-                    mult = risk_multiplier(predicted_wr, MIN_WINRATE)
+                    mult = risk_multiplier(predicted_wr, active_min_winrate)
 
                     sl_price = entry_price + SL_PIPS * PIP_VALUE
                     tp_price = entry_price - candidate_tp_pips * PIP_VALUE
@@ -1695,7 +1733,8 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_W
                     print(f"RF:              {rf:.2f}")
                     print(f"Sharpe:          {sharpe:.2f}")
                     print(f"Sortino:         {sortino:.2f}")
-                    print(f"MIN_WINRATE:     {MIN_WINRATE*100:.1f}%")
+                    print(f"Min WR (stoch):  {STOCH_MIN_WINRATE*100:.1f}%")
+                    print(f"Min WR (level):  {LEVEL_MIN_WINRATE*100:.1f}%")
                     filter_state = (
                         "ACTIVE" if gbdt.ready()
                         else f"bootstrapping ({gbdt.weeks_trained}/{WEEKS_BEFORE_FILTER} weeks)"
@@ -1733,7 +1772,8 @@ def train_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_W
                     gbdt.weeks_trained += 1
                     if gbdt.fit():
                         gbdt.save()
-                        MIN_WINRATE = gbdt.min_winrate(min_winrate)
+                        STOCH_MIN_WINRATE = gbdt.min_winrate(stoch_base_min_winrate)
+                        LEVEL_MIN_WINRATE = gbdt.min_winrate(level_base_min_winrate)
                         print(
                             f"[{symbol}] [INFO] GBDT filter refit on "
                             f"{len(gbdt.X)} trades and saved"
@@ -1783,7 +1823,7 @@ def _rename_mt5_rates(d):
     return d[["Open", "High", "Low", "Close"]]
 
 
-def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_WINRATE):
+def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=None):
 
     if mt5 is None:
         raise RuntimeError(
@@ -1800,7 +1840,15 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_WI
 
     gbdt = GBDTWinRateFilter(tag)
     gbdt.load()
-    MIN_WINRATE = gbdt.min_winrate(min_winrate)
+
+    # Two separate bars -- one per strategy tier's own RR -- unless
+    # --min-winrate passed one flat number for both. See
+    # STOCH_MIN_WINRATE_DEFAULT/LEVEL_MIN_WINRATE_DEFAULT.
+    stoch_base_min_winrate = min_winrate if min_winrate is not None else STOCH_MIN_WINRATE_DEFAULT
+    level_base_min_winrate = min_winrate if min_winrate is not None else LEVEL_MIN_WINRATE_DEFAULT
+
+    STOCH_MIN_WINRATE = gbdt.min_winrate(stoch_base_min_winrate)
+    LEVEL_MIN_WINRATE = gbdt.min_winrate(level_base_min_winrate)
 
     # ==========================================================
     # INITIAL LOAD
@@ -1925,6 +1973,13 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_WI
             poi_bull, poi_bear, ob_bull, ob_bear,
         )
 
+        # Which of the two bars applies depends on which strategy the
+        # candidate came from -- see train_bot()'s same logic.
+        active_min_winrate = (
+            STOCH_MIN_WINRATE if candidate_strategy == "stoch_breakout"
+            else LEVEL_MIN_WINRATE
+        )
+
         if action in (BUY, SELL):
             action = candidate if candidate != HOLD else HOLD
 
@@ -1932,7 +1987,7 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_WI
         predicted_wr = None
         if action in (BUY, SELL) and gbdt.ready():
             predicted_wr = gbdt.predict_win_rate(state)
-            if predicted_wr < MIN_WINRATE:
+            if predicted_wr < active_min_winrate:
                 action = HOLD
 
         current_time = df.index[-1]
@@ -1956,7 +2011,7 @@ def test_bot(symbol="XAUUSD", risk=0.01, htf_mode="any", min_winrate=BASE_MIN_WI
             account = mt5.account_info()
             balance = account.balance
 
-            mult = risk_multiplier(predicted_wr, MIN_WINRATE)
+            mult = risk_multiplier(predicted_wr, active_min_winrate)
             effective_risk = risk * mult
 
             # Lot size: hitting the initial SL costs effective_risk% of
@@ -2004,16 +2059,18 @@ def main():
         )
     )
     parser.add_argument(
-        "--min-winrate", type=float, default=BASE_MIN_WINRATE, dest="min_winrate",
+        "--min-winrate", type=float, default=None, dest="min_winrate",
         help=(
-            "GBDT win-rate filter threshold (default "
-            f"{BASE_MIN_WINRATE:.2f} = {BASE_MIN_WINRATE*100:.0f}%%). Applies "
-            "as one shared function across all three entry strategies -- the "
-            "1:4 RR stoch/%R breakout and the two 1:2 RR PDH/PDL/Asia + OB "
-            "level strategies alike, not tiered per RR -- and to both "
-            "--train and --test (GBDTWinRateFilter.min_winrate() may still "
-            "raise it further once the filter's sample buffer saturates; "
-            "see BASE_MIN_WINRATE / elevated_min_winrate)."
+            "GBDT win-rate filter threshold, for both --train and --test. "
+            "Default (omit this flag): computed per strategy tier as "
+            "breakeven*1.1 floored at 35%% -- "
+            f"{STOCH_MIN_WINRATE_DEFAULT*100:.1f}%% for the 1:4 RR stoch/%R "
+            f"breakout, {LEVEL_MIN_WINRATE_DEFAULT*100:.1f}%% for the two "
+            "1:2 RR PDH/PDL/Asia + OB level strategies (see "
+            "_default_min_winrate()). Pass a value here to use one flat "
+            "number for both tiers instead. Either way, "
+            "GBDTWinRateFilter.min_winrate() may still raise it further "
+            "once the filter's sample buffer saturates (elevated_min_winrate)."
         )
     )
 
